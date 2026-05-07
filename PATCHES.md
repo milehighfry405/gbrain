@@ -15,21 +15,12 @@ This fork carries patches on top of upstream `garrytan/gbrain`. Each patch track
 **Test:** `./scripts/validate-patches.sh` test 1
 **Drop when:** PR #639 (or equivalent) merges to upstream master.
 
-### 2. DB→Markdown Write-Through on put_page (PR #438)
-
-**Commit:** `6f7e545`
-**Upstream PR:** https://github.com/garrytan/gbrain/pull/438
-**Author:** rayzhux (original), ported by us (write-through only, no auto-link security changes)
-**Issue:** Agent `put_page` via MCP writes to DB only. The markdown repo never gets the file, causing repo/DB divergence.
-**Fix:** After successful remote `put_page`, renders page back to `${GBRAIN_BRAIN_ROOT}/<slug>.md` via `serializeMarkdown`. Opt-in via `GBRAIN_BRAIN_ROOT` env var.
-**Files changed:** `src/core/operations.ts`
-**Requires:** `GBRAIN_BRAIN_ROOT` env var set to the brain repo path (e.g., `/data/brain`)
-**Test:** `./scripts/validate-patches.sh` test 2
-**Drop when:** PR #438 (or equivalent write-through) merges to upstream master.
-
 ## Retired Patches
 
-*None yet.*
+### DB→Markdown Write-Through on put_page (PR #438) — REMOVED 2026-05-07
+
+**Reason:** Reverted to upstream `put_page` behavior (DB-only). Dream cycle handles link/timeline materialization. The write-through created double-write conflicts with dream's `reverseWriteSlugs()`. Garry's intended model: agent uses `put_page` → DB, dream cycle handles the rest. The fork only carries the source_id routing fix now.
+**Upstream PR:** https://github.com/garrytan/gbrain/pull/438
 
 ## Upgrade Workflow
 

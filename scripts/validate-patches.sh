@@ -62,39 +62,10 @@ else
 fi
 echo ""
 
-# --- Test 2: Write-Through (PR #438) ---
-echo "--- Test 2: DB→Markdown Write-Through (PR #438) ---"
-echo "Checks: does put_page render .md to disk when GBRAIN_BRAIN_ROOT is set?"
-
-if grep -q "exportToBrainRepo" "$FORK_DIR/src/core/operations.ts" 2>/dev/null; then
-  green "PASS: exportToBrainRepo function present in operations.ts"
-  PASS=$((PASS + 1))
-else
-  red "FAIL: exportToBrainRepo missing from operations.ts — patch may have been dropped"
-  FAIL=$((FAIL + 1))
-fi
-
-if grep -q "brain_export" "$FORK_DIR/src/core/operations.ts" 2>/dev/null; then
-  green "PASS: brain_export response field present"
-  PASS=$((PASS + 1))
-else
-  red "FAIL: brain_export response field missing"
-  FAIL=$((FAIL + 1))
-fi
-
-if grep -q "GBRAIN_BRAIN_ROOT" "$FORK_DIR/src/core/operations.ts" 2>/dev/null; then
-  green "PASS: GBRAIN_BRAIN_ROOT env var check present"
-  PASS=$((PASS + 1))
-else
-  red "FAIL: GBRAIN_BRAIN_ROOT env var check missing"
-  FAIL=$((FAIL + 1))
-fi
-
-# Check if upstream fixed it
-if grep -q "exportToBrainRepo\|GBRAIN_BRAIN_ROOT" "$FORK_DIR/src/core/operations.ts" 2>/dev/null; then
-  # Could be our patch or upstream's fix — either way it's there
-  true
-fi
+# --- Test 2: Write-Through (PR #438) — RETIRED ---
+echo "--- Test 2: DB→Markdown Write-Through (PR #438) — RETIRED ---"
+yellow "SKIP: Write-through patch removed. Using upstream put_page (DB-only) + dream cycle."
+SKIP=$((SKIP + 1))
 echo ""
 
 # --- Test 3: Upstream PR status check ---
@@ -102,7 +73,7 @@ echo "--- Test 3: Upstream PR Status ---"
 echo "Checking if tracked PRs have been merged..."
 
 if command -v gh &>/dev/null; then
-  for pr in 639 438; do
+  for pr in 639; do
     state=$(gh pr view "$pr" --repo garrytan/gbrain --json state -q '.state' 2>/dev/null || echo "UNKNOWN")
     if [ "$state" = "MERGED" ]; then
       yellow "PR #$pr: MERGED — this patch may no longer be needed. Rebase and test."
