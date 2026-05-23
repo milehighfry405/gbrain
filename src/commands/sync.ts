@@ -44,6 +44,18 @@ export interface SyncResult {
   embedded: number;
   pagesAffected: string[];
   failedFiles?: number; // count of parse failures (Bug 9)
+  /**
+   * v0.40.x (l5o.4 fix) — facts pipeline counters surfaced from the inline
+   * extraction loop in performIncrementalSync. Undefined when the facts
+   * block was skipped (noExtract / noInlineFacts / empty pagesAffected /
+   * >50 pages / called from performFullSync). When defined, sums across
+   * all pages in this sync. `factsErrored` counts caller-side throws that
+   * `writeFactsAbsorbLog` recorded to ingest_log.
+   */
+  factsInserted?: number;
+  factsDuplicate?: number;
+  factsSuperseded?: number;
+  factsErrored?: number;
 }
 
 /**
@@ -161,6 +173,18 @@ export interface SyncOpts {
    * v0.22.13 (PR #490 CODEX-2). Not part of the public CLI surface.
    */
   skipLock?: boolean;
+  /**
+   * v0.40.x (l5o.4 fix) — opt out of inline facts extraction in the
+   * incremental sync's per-page loop. Default is inline: the prior
+   * `mode: 'queue'` default silently dropped pending + in-flight LLM
+   * extraction jobs on CLI exit (FactsQueue is a process-local singleton
+   * intended for long-lived hosts; sync never called shutdown()). Symptom:
+   * facts table frozen, zero `facts:absorb` rows ever in ingest_log.
+   * Inline mode serializes the same pipeline queue mode would have run;
+   * only latency moves into sync's awaited window. Pass `--no-inline-facts`
+   * to defer extraction to a separate cycle/extract_facts call.
+   */
+  noInlineFacts?: boolean;
 }
 
 /**
@@ -966,22 +990,46 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     } catch { /* extraction is best-effort */ }
   }
 
-  // v0.31.2: facts extraction now routes through the shared
-  // src/core/facts/backstop.ts helper (PR1 commit 6). Sync uses
-  // queue mode (fire-and-forget) + 'high-only' filter so a 50-page
-  // sync doesn't block on N sequential Sonnet calls. The pre-fix
-  // inline loop is gone — it carried (a) a dead-code type filter
-  // ('conversation'/'transcript'/'therapy'/'call' aren't real
-  // PageTypes), (b) a divergent eligibility shape from put_page,
-  // and (c) raw extract→insert without dedup/supersede.
-  if (!opts.noExtract && pagesAffected.length > 0 && pagesAffected.length <= 50) {
+  // v0.31.2 + v0.40.x (l5o.4 fix): facts extraction routes through the
+  // shared src/core/facts/backstop.ts helper (PR1 commit 6). Pre-l5o.4
+  // sync used `mode: 'queue'` (fire-and-forget) so a 50-page sync didn't
+  // block on N sequential Sonnet calls — but FactsQueue is a process-
+  // local singleton (queue.ts:13) and sync is a short-lived CLI that
+  // never calls shutdown(). Result: pending + inflight jobs evaporated
+  // on process exit, brain stayed at the run-17 backfill count, and the
+  // absorb-log writer (which lives INSIDE the queue worker) never ran —
+  // so zero `facts:absorb` rows ever appeared in ingest_log.
+  //
+  // Fix: switch to `mode: 'inline'`. Sync now awaits the same pipeline
+  // queue mode would have run (per-session-inflight cap = 1; serialization
+  // shape unchanged; only latency moves into sync's awaited window).
+  // Errors bubble (backstop.ts:194-200 contract), so sync owns the
+  // absorb-log write per-page to keep doctor's facts_extraction_health
+  // probe seeing failures on this surface. `--no-inline-facts` opts out
+  // for operators who want to defer extraction to a cycle/extract_facts
+  // call. The 50-page cap stays.
+  //
+  // The pre-fix inline loop (gone in PR1) carried (a) a dead-code type
+  // filter ('conversation'/'transcript'/'therapy'/'call' aren't real
+  // PageTypes), (b) a divergent eligibility shape from put_page, and
+  // (c) raw extract→insert without dedup/supersede. The current inline
+  // path uses the shared backstop pipeline and inherits all three fixes.
+  let factsInserted = 0;
+  let factsDuplicate = 0;
+  let factsSuperseded = 0;
+  let factsErrored = 0;
+  let factsSkipped = 0;
+  if (!opts.noExtract && !opts.noInlineFacts &&
+      pagesAffected.length > 0 && pagesAffected.length <= 50) {
     const { runFactsBackstop } = await import('../core/facts/backstop.ts');
+    const { writeFactsAbsorbLog, classifyFactsAbsorbError } =
+      await import('../core/facts/absorb-log.ts');
     const factsSourceId = opts.sourceId ?? 'default';
     for (const slug of pagesAffected) {
       try {
         const page = await engine.getPage(slug);
         if (!page) continue;
-        await runFactsBackstop(
+        const r = await runFactsBackstop(
           {
             slug,
             type: page.type,
@@ -993,11 +1041,37 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             sourceId: factsSourceId,
             sessionId: `sync:${slug}`,
             source: 'sync:import',
-            mode: 'queue',
+            mode: 'inline',
             notabilityFilter: 'high-only',
           },
         );
-      } catch { /* per-page enqueue is best-effort */ }
+        if (r.mode === 'inline') {
+          if (r.skipped) {
+            factsSkipped += 1;
+          } else {
+            factsInserted += r.inserted;
+            factsDuplicate += r.duplicate;
+            factsSuperseded += r.superseded;
+          }
+        }
+      } catch (err) {
+        // Inline mode bubbles errors (per backstop.ts:194-200 contract).
+        // Own the absorb-log write here so doctor's facts_extraction_health
+        // probe still sees per-source failure counters on this surface.
+        factsErrored += 1;
+        const reason = classifyFactsAbsorbError(err);
+        const msg = err instanceof Error ? err.message : String(err);
+        try {
+          await writeFactsAbsorbLog(engine, slug, reason, msg, factsSourceId);
+        } catch { /* observability is best-effort */ }
+      }
+    }
+    if (factsInserted > 0 || factsDuplicate > 0 || factsSuperseded > 0 || factsErrored > 0) {
+      console.log(
+        `  Facts: ${factsInserted} new, ${factsDuplicate} dup, ${factsSuperseded} superseded` +
+        (factsErrored > 0 ? `, ${factsErrored} errored (see ingest_log)` : '') +
+        (factsSkipped > 0 ? `, ${factsSkipped} skipped` : ''),
+      );
     }
   }
 
@@ -1043,6 +1117,15 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     chunksCreated,
     embedded,
     pagesAffected,
+    // l5o.4: surface inline facts counters so --json consumers + watch-mode
+    // loggers can see extraction activity. Undefined-equivalents (counters
+    // stay 0 when the facts block was skipped) collapse here to 0/undefined
+    // ergonomically — present-as-0 reads the same as "ran but found nothing"
+    // which is the truthful semantic.
+    factsInserted,
+    factsDuplicate,
+    factsSuperseded,
+    factsErrored,
   };
 }
 
@@ -1237,6 +1320,7 @@ See also:
   const full = args.includes('--full');
   const noPull = args.includes('--no-pull');
   const noEmbed = args.includes('--no-embed');
+  const noInlineFacts = args.includes('--no-inline-facts');
   const skipFailed = args.includes('--skip-failed');
   const retryFailed = args.includes('--retry-failed');
   const syncAll = args.includes('--all');
@@ -1363,6 +1447,7 @@ See also:
         sourceId: src.id,
         strategy: cfg.strategy,
         concurrency,
+        noInlineFacts,
       };
       try {
         const result = await performSync(engine, repoOpts);
@@ -1381,7 +1466,7 @@ See also:
     return;
   }
 
-  const opts: SyncOpts = { repoPath, dryRun, full, noPull, noEmbed, skipFailed, retryFailed, sourceId, strategy: strategyArg, concurrency };
+  const opts: SyncOpts = { repoPath, dryRun, full, noPull, noEmbed, skipFailed, retryFailed, sourceId, strategy: strategyArg, concurrency, noInlineFacts };
 
   // Bug 9 — --retry-failed: before running normal sync, clear acknowledgment
   // flags so the sync picks them up as fresh work. The actual re-attempt
