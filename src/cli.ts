@@ -3,6 +3,41 @@
 import { installSigchldHandler } from './core/zombie-reap.ts';
 installSigchldHandler();
 
+// v0.40.x (l5o.4 wave): cwd-independent .env fallback loader. Bun's native
+// .env loader is keyed on cwd — `gbrain sync` invoked from a directory
+// without a .env file gets no chat-tier keys, and extract.ts:157 silently
+// returns [] (no facts, no absorb-log row, frozen brain). Fall back to
+// well-known config paths: GBRAIN_ENV_FILE override → $HOME/.gbrain/.env
+// (canonical per-user config dir). Existing env vars win — this is a
+// fallback, not an override. Best-effort; failures leave process.env as-is.
+{
+  try {
+    const { existsSync, readFileSync: _readFileSync } = await import('node:fs');
+    const { homedir } = await import('node:os');
+    const { join } = await import('node:path');
+    const candidates = [
+      process.env.GBRAIN_ENV_FILE,
+      join(homedir(), '.gbrain', '.env'),
+    ].filter((p): p is string => !!p && existsSync(p));
+    for (const path of candidates) {
+      const text = _readFileSync(path, 'utf-8');
+      for (const rawLine of text.split('\n')) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) continue;
+        const eq = line.indexOf('=');
+        if (eq < 1) continue;
+        const key = line.slice(0, eq).trim();
+        let value = line.slice(eq + 1).trim();
+        if ((value.startsWith('"') && value.endsWith('"')) ||
+            (value.startsWith("'") && value.endsWith("'"))) {
+          value = value.slice(1, -1);
+        }
+        if (key && !(key in process.env)) process.env[key] = value;
+      }
+    }
+  } catch { /* best-effort; gbrain falls back to whatever's in process.env */ }
+}
+
 import { readFileSync } from 'fs';
 import { loadConfig, loadConfigWithEngine, toEngineConfig, isThinClient } from './core/config.ts';
 import type { GBrainConfig } from './core/config.ts';

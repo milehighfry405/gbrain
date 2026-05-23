@@ -144,6 +144,16 @@ const EXTRACTOR_SYSTEM = [
 
 const MAX_TURN_TEXT_CHARS = 8000;
 
+/**
+ * v0.40.x (l5o.4 wave): once-per-process guard for the chat-unavailable
+ * facts:absorb row. Reset only via process restart (or the test helper).
+ */
+let _chatUnavailableLogged = false;
+/** Test-only: reset the chat-unavailable absorb-log memo. */
+export function __resetChatUnavailableMemoForTests(): void {
+  _chatUnavailableLogged = false;
+}
+
 export async function extractFactsFromTurn(input: ExtractInput): Promise<ExtractedFact[]> {
   if (input.isDreamGenerated) return [];
   if (!input.turnText) return [];
@@ -157,6 +167,26 @@ export async function extractFactsFromTurn(input: ExtractInput): Promise<Extract
   if (!isAvailable('chat')) {
     // No chat gateway → no extraction. Caller still inserts facts via direct
     // `gbrain take add` paths.
+    //
+    // v0.40.x (l5o.4 wave): write a single facts:absorb row on first miss in
+    // this process so doctor's facts_extraction_health probe surfaces the
+    // unavailability. Pre-fix this branch was a silent void — brain went
+    // frozen + zero absorb-log rows ever (the silent-drop class). The
+    // once-per-process guard keeps a 50-page sync from spraying 50 rows;
+    // one row is enough to flag the configuration gap. Best-effort; never
+    // bubble the absorb-log failure to the caller.
+    if (input.engine && !_chatUnavailableLogged) {
+      _chatUnavailableLogged = true;
+      try {
+        const { writeFactsAbsorbLog } = await import('./absorb-log.ts');
+        await writeFactsAbsorbLog(
+          input.engine,
+          input.sessionId ?? `(extract:${input.source})`,
+          'gateway_error',
+          `chat gateway not available — extraction skipped. Check ANTHROPIC_API_KEY in process env or ~/.gbrain/.env (or set GBRAIN_ENV_FILE).`,
+        );
+      } catch { /* observability is best-effort */ }
+    }
     return [];
   }
 
