@@ -54,12 +54,20 @@ export async function resolveEntitySlug(
     if (exact) return exact;
   }
 
-  // 2. Fuzzy match against existing pages within the source. Match either
+  // 2. Hyphen-prefix-rewrite: `people-ben` → `people/ben-*`,
+  //    `companies-arthur` → `companies/arthur-ai`. The LLM extractor
+  //    occasionally emits the directory-name as a hyphen prefix instead
+  //    of a slash; rewrite it so a real page lookup can succeed before
+  //    the stub guard fires at fence-write time.
+  const rewritten = await tryHyphenPrefixRewrite(engine, source_id, trimmed);
+  if (rewritten) return rewritten;
+
+  // 3. Fuzzy match against existing pages within the source. Match either
   //    on slug fragment or on title.
   const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
   if (fuzzy) return fuzzy;
 
-  // 3. Prefix-expansion match: when the input looks like a bare first name
+  // 4. Prefix-expansion match: when the input looks like a bare first name
   //    (no slash, no prefix, slugifies to a single short token), try
   //    `people/<token>-%` then `companies/<token>-%`. Short bare names
   //    score terribly on pg_trgm — similarity('alice', 'alice-example')
@@ -71,7 +79,7 @@ export async function resolveEntitySlug(
     if (expanded) return expanded;
   }
 
-  // 4. Fallback: deterministic slugify.
+  // 5. Fallback: deterministic slugify.
   return slugify(trimmed);
 }
 
@@ -95,6 +103,67 @@ function isBareName(raw: string): boolean {
 }
 
 const PREFIX_EXPANSION_DIRS = ['people', 'companies'] as const;
+
+/**
+ * Directories the hyphen-prefix-rewrite step will route into. When the LLM
+ * extractor emits a slug like `people-ben` or `companies-arthur` (hyphen
+ * instead of slash, because the model picked up the directory-name from
+ * surrounding context but slugified the whole thing), this list names the
+ * brain directories we know about so the rewrite step can route them back
+ * to slash-form. Derived empirically from the v0.34.5+ stub-guard audit
+ * log (workspace-i75): every directory below appeared as `<dir>-*` in the
+ * audit log AND exists as a real brain directory under /data/brain.
+ *
+ * Bead workspace-i75's AC named `data-` and `comms-` as prefixes to
+ * expand, but neither exists as a brain directory in /data/brain (verified
+ * 2026-05-24); their fall-through here is intentional. The `data-*` /
+ * `comms-*` hits (~19/24h) are LLM extraction-side noise (the model is
+ * slugifying filesystem paths or section names that have no fence target)
+ * and are being tracked separately in workspace-l5o.36.
+ *
+ * Lookup uses descending-length matching (see HYPHEN_PREFIX_REWRITE_SORTED
+ * below) so a future hyphenated directory like `personal-reflections/`
+ * disambiguates correctly against `personal/`. Today no directory in this
+ * list contains a hyphen, but the structural correctness matters for
+ * future additions.
+ */
+const HYPHEN_PREFIX_REWRITE_DIRS = [
+  'people',
+  'companies',
+  'projects',
+  'personal',
+  'sessions',
+  'transcripts',
+  'wiki',
+  'agent',
+  'ideas',
+  'concepts',
+  'deals',
+  'meetings',
+  'hiring',
+  'civic',
+  'household',
+  'ops',
+  'org',
+  'archive',
+  'sources',
+  'programs',
+  'media',
+  'inbox',
+] as const;
+
+/**
+ * Same set as HYPHEN_PREFIX_REWRITE_DIRS but sorted descending by length.
+ * Greedy-longest-first matching: if both `foo` and `foo-bar` were
+ * registered, `foo-bar-baz` resolves via `foo-bar/baz` (NOT `foo/bar-baz`).
+ * Codex P2 from workspace-i75 review — the structural bug a naive
+ * `splitOnFirstHyphen` would have.
+ *
+ * Exported so tests can assert the sort invariant + exercise the rewrite
+ * helper against a known-shape dir list.
+ */
+export const HYPHEN_PREFIX_REWRITE_SORTED: readonly string[] =
+  [...HYPHEN_PREFIX_REWRITE_DIRS].sort((a, b) => b.length - a.length);
 
 /**
  * v0.40.2.0 — resolution-source-tagged variant for trajectory routing.
@@ -130,6 +199,12 @@ export async function resolveEntitySlugWithSource(
     const exact = await tryExactSlug(engine, source_id, trimmed);
     if (exact) return { slug: exact, source: 'exact_page' };
   }
+
+  const rewritten = await tryHyphenPrefixRewrite(engine, source_id, trimmed);
+  // Tag as fuzzy_match — same rationale as bare-name prefix expansion:
+  // the result is a real-page resolution, so trajectory routing can
+  // safely query it instead of treating it as an invented slug.
+  if (rewritten) return { slug: rewritten, source: 'fuzzy_match' };
 
   const fuzzy = await tryFuzzyMatch(engine, source_id, trimmed);
   if (fuzzy) return { slug: fuzzy, source: 'fuzzy_match' };
@@ -241,6 +316,66 @@ export async function findPrefixCandidates(
 }
 
 /**
+ * Hyphen-prefix-rewrite detector + lookup.
+ *
+ * The v0.34.5 stub guard refuses to spawn entity pages at the brain root
+ * (any slug without a `/`). When the LLM extractor emits `people-ben`,
+ * `companies-arthur`, etc., the slug structurally can't be fenced. Before
+ * v0.40.2.x this case fell through to slugify and the slug stayed
+ * hyphen-form, triggering the stub guard. Audit-log evidence from
+ * workspace-i75: `people-ben` x43, `companies-palantir` x3, etc.
+ *
+ * Rewrite logic: if `trimmed` is a lowercase slug-shape with hyphens but
+ * no slash, AND the first hyphen-separated token names a known brain
+ * directory, try:
+ *   1. Exact match on `<dir>/<rest>` (covers `companies-stripe` →
+ *      `companies/stripe` when the page is the bare child).
+ *   2. Prefix expansion on `<dir>/<rest>-%` (covers `people-ben` →
+ *      `people/ben-fry` when the page is hyphen-suffixed).
+ *
+ * Returns null when no candidate matches; the caller continues with the
+ * normal chain (fuzzy → bare-name prefix expansion → slugify fallback).
+ *
+ * Why this can't be the existing `isBareName` path: `isBareName` rejects
+ * any input that slugifies with a hyphen (`alice-example` → rejected).
+ * Hyphen-prefix slugs are by construction multi-token-after-slugify.
+ */
+async function tryHyphenPrefixRewrite(
+  engine: BrainEngine,
+  source_id: string,
+  trimmed: string,
+): Promise<string | null> {
+  if (!looksLikeSlug(trimmed)) return null;
+  if (trimmed.includes('/')) return null;
+  if (!trimmed.includes('-')) return null;
+
+  // Greedy-longest-first directory match. HYPHEN_PREFIX_REWRITE_SORTED is
+  // sorted by descending length so `personal-reflections-foo` (if
+  // `personal-reflections/` were a registered dir) would match the longer
+  // prefix before the shorter `personal/`. We bail on the first dir whose
+  // candidate exact-slug exists OR whose prefix-expansion has any hit.
+  for (const dir of HYPHEN_PREFIX_REWRITE_SORTED) {
+    const sep = `${dir}-`;
+    if (!trimmed.startsWith(sep)) continue;
+    const rest = trimmed.slice(sep.length);
+    if (!rest) continue;
+
+    const exact = await tryExactSlug(engine, source_id, `${dir}/${rest}`);
+    if (exact) return exact;
+
+    const expanded = await tryPrefixExpansionForDir(engine, source_id, dir, rest);
+    if (expanded) return expanded;
+
+    // Important: do NOT continue to shorter dirs. If `people-zzznonexistent`
+    // doesn't resolve under `people/`, falling back to a shorter prefix
+    // would be nonsense — we already matched the most-specific directory.
+    return null;
+  }
+
+  return null;
+}
+
+/**
  * Look up pages whose slug starts with `<dir>/<token>-` for each known
  * entity directory. When multiple candidates match within a directory,
  * pick the one with the highest connection count (links_in + links_out +
@@ -254,56 +389,62 @@ async function tryPrefixExpansion(
   token: string,
 ): Promise<string | null> {
   for (const dir of PREFIX_EXPANSION_DIRS) {
-    const pattern = `${dir}/${token}-%`;
-    try {
-      const rows = await engine.executeRaw<{
-        slug: string;
-        connection_count: number;
-      }>(
-        // Connection count is a simple proxy for canonicality:
-        // (incoming links) + (outgoing links) + (content chunks).
-        //
-        // SQL shape: correlated subqueries scoped to the slug-LIKE
-        // candidates. The pre-v0.34.5 version used derived-table JOINs
-        // (SELECT FROM links GROUP BY to_page_id, etc.) which forced the
-        // planner to aggregate the FULL links + content_chunks tables on
-        // every prefix-expansion call — O(N) per call where N is total
-        // links/chunks in the brain. On a 100K-link / 50K-chunk brain
-        // that's slow.
-        //
-        // The slug LIKE filter is already selective in practice (typical
-        // brain has 0-5 pages per prefix), so the correlated subqueries
-        // run N=3 times per matched row, hitting the indexes on
-        // links.to_page_id, links.from_page_id, and content_chunks.page_id
-        // directly. Even on a pathological prefix matching 1000+ pages,
-        // work is bounded per-candidate, not whole-table.
-        `SELECT p.slug,
-                ((SELECT COUNT(*)::int FROM links WHERE to_page_id = p.id)
-                 + (SELECT COUNT(*)::int FROM links WHERE from_page_id = p.id)
-                 + (SELECT COUNT(*)::int FROM content_chunks WHERE page_id = p.id))
-                  AS connection_count
-         FROM pages p
-         WHERE p.source_id = $1
-           AND p.deleted_at IS NULL
-           AND p.slug LIKE $2
-         ORDER BY connection_count DESC, p.slug ASC
-         LIMIT 5`,
-        [source_id, pattern],
-      );
-      if (rows.length === 0) continue;
-      // Single unambiguous match: return it.
-      if (rows.length === 1) return rows[0].slug;
-      // Multiple matches: the top row (sorted by connection_count desc)
-      // wins. The slug-ASC secondary key makes ties deterministic when
-      // connection counts collide — important for test pinning.
-      return rows[0].slug;
-    } catch {
-      // Defensive: a missing table or index shouldn't crash extraction.
-      // Try the next directory (or fall through to slugify).
-      continue;
-    }
+    const hit = await tryPrefixExpansionForDir(engine, source_id, dir, token);
+    if (hit) return hit;
   }
   return null;
+}
+
+async function tryPrefixExpansionForDir(
+  engine: BrainEngine,
+  source_id: string,
+  dir: string,
+  token: string,
+): Promise<string | null> {
+  const pattern = `${dir}/${token}-%`;
+  try {
+    const rows = await engine.executeRaw<{
+      slug: string;
+      connection_count: number;
+    }>(
+      // Connection count is a simple proxy for canonicality:
+      // (incoming links) + (outgoing links) + (content chunks).
+      //
+      // SQL shape: correlated subqueries scoped to the slug-LIKE
+      // candidates. The pre-v0.34.5 version used derived-table JOINs
+      // (SELECT FROM links GROUP BY to_page_id, etc.) which forced the
+      // planner to aggregate the FULL links + content_chunks tables on
+      // every prefix-expansion call — O(N) per call where N is total
+      // links/chunks in the brain. On a 100K-link / 50K-chunk brain
+      // that's slow.
+      //
+      // The slug LIKE filter is already selective in practice (typical
+      // brain has 0-5 pages per prefix), so the correlated subqueries
+      // run N=3 times per matched row, hitting the indexes on
+      // links.to_page_id, links.from_page_id, and content_chunks.page_id
+      // directly. Even on a pathological prefix matching 1000+ pages,
+      // work is bounded per-candidate, not whole-table.
+      `SELECT p.slug,
+              ((SELECT COUNT(*)::int FROM links WHERE to_page_id = p.id)
+               + (SELECT COUNT(*)::int FROM links WHERE from_page_id = p.id)
+               + (SELECT COUNT(*)::int FROM content_chunks WHERE page_id = p.id))
+                AS connection_count
+       FROM pages p
+       WHERE p.source_id = $1
+         AND p.deleted_at IS NULL
+         AND p.slug LIKE $2
+       ORDER BY connection_count DESC, p.slug ASC
+       LIMIT 5`,
+      [source_id, pattern],
+    );
+    if (rows.length === 0) return null;
+    // Single unambiguous match OR multi-match with deterministic top
+    // row (connection_count DESC, slug ASC) — both collapse to rows[0].
+    return rows[0].slug;
+  } catch {
+    // Defensive: a missing table or index shouldn't crash extraction.
+    return null;
+  }
 }
 
 function looksLikeSlug(s: string): boolean {

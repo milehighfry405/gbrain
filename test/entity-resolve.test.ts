@@ -3,6 +3,7 @@ import {
   resolveEntitySlug,
   resolveEntitySlugWithSource,
   slugify,
+  HYPHEN_PREFIX_REWRITE_SORTED,
   type ResolutionSource,
 } from '../src/core/entities/resolve.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -41,6 +42,16 @@ beforeAll(async () => {
     { slug: 'people/dave-example', title: 'Dave Example', type: 'person' },
     { slug: 'companies/stripe', title: 'Stripe', type: 'company' },
     { slug: 'companies/stripe-atlas', title: 'Stripe Atlas', type: 'company' },
+    // workspace-i75 collision boundary: `people-organizations` has no
+    // exact `people/organizations` page, but `people/organizations-*`
+    // exists. Pins that the expansion path (not the exact path) wins.
+    { slug: 'people/organizations-foo', title: 'Organizations Foo', type: 'person' },
+    // workspace-i75 greedy-longest demo: `personal/` is a registered
+    // dir; `personal-reflections-foo` rewrites to `personal/reflections-foo`
+    // via the existing (single-token-dir) path. When/if a future
+    // `personal-reflections/` dir gets added to HYPHEN_PREFIX_REWRITE_DIRS,
+    // the sort invariant guarantees it wins over `personal/`.
+    { slug: 'personal/reflections-foo', title: 'Reflections Foo', type: 'concept' },
   ];
 
   for (const p of pages) {
@@ -154,6 +165,211 @@ describe('resolveEntitySlug — prefix expansion', () => {
     const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', '');
     expect(result).toBeNull();
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// workspace-i75 — hyphen-prefix-rewrite step
+// ─────────────────────────────────────────────────────────────────────
+//
+// When the LLM extractor emits `people-ben`, `companies-arthur`, etc.,
+// the resolver detects the hyphen-prefix shape, slices off the
+// directory token, and tries `<dir>/<rest>` (exact) then
+// `<dir>/<rest>-%` (expansion). Empirically: stub-guard audit log
+// showed `people-ben` x43, `companies-palantir` x3, etc. before this
+// step existed.
+
+describe('resolveEntitySlug — hyphen-prefix rewrite', () => {
+  it('rewrites "people-alice" to people/alice-example (prefix expansion)', async () => {
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'people-alice');
+    expect(result).toBe('people/alice-example');
+  });
+
+  it('rewrites "people-bob" to people/bob-example (multi-match, connection tiebreak)', async () => {
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'people-bob');
+    expect(result).toBe('people/bob-example');
+  });
+
+  it('rewrites "companies-stripe" to companies/stripe (exact bare-child match)', async () => {
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'companies-stripe');
+    expect(result).toBe('companies/stripe');
+  });
+
+  it('rewrites "companies-stripe-atlas" via exact match on rest', async () => {
+    // dir=companies, rest=stripe-atlas → exact match on companies/stripe-atlas
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'companies-stripe-atlas');
+    expect(result).toBe('companies/stripe-atlas');
+  });
+
+  it('does NOT rewrite unknown-directory prefix "data-claude-conventions" (falls through to slugify)', async () => {
+    // `data/` is not a brain directory — no rewrite, no fuzzy hit, no
+    // bare-name expansion (hyphenated → isBareName false). Slugify
+    // returns the input unchanged.
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'data-claude-conventions');
+    expect(result).toBe('data-claude-conventions');
+  });
+
+  it('does NOT rewrite when the rest matches no page (falls through)', async () => {
+    // `people/` is a known dir but `people/zzznonexistent-*` matches nothing.
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'people-zzznonexistent');
+    expect(result).toBe('people-zzznonexistent');
+  });
+
+  it('does NOT rewrite a leading-hyphen-only slug', async () => {
+    // No directory token to slice — first hyphen at position 0.
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', '-trailing');
+    expect(result).toBe('trailing');
+  });
+
+  it('returns the exact slug when the literal hyphen-form already exists in DB', async () => {
+    // If a brain has a page literally at slug `people-ben` (unlikely but
+    // possible), the exact-slug step at the top of the chain returns it
+    // before the rewrite step runs. This pins that ordering.
+    await engine.putPage('people-literal-test', {
+      type: 'person' as any,
+      title: 'People Literal Test',
+      compiled_truth: '# x',
+      frontmatter: { type: 'person', title: 'People Literal Test', slug: 'people-literal-test' },
+    }, { sourceId: 'default' });
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'people-literal-test');
+    expect(result).toBe('people-literal-test');
+  });
+});
+
+describe('resolveEntitySlugWithSource — hyphen-prefix rewrite tagging', () => {
+  it('tags hyphen-prefix rewrite as fuzzy_match (real-page resolution)', async () => {
+    const result = await resolveEntitySlugWithSource(
+      engine as unknown as BrainEngine,
+      'default',
+      'people-alice',
+    );
+    expect(result!.slug).toBe('people/alice-example');
+    expect(result!.source).toBe<ResolutionSource>('fuzzy_match');
+  });
+
+  it('tags unknown-directory hyphen-prefix as fallback_slugify', async () => {
+    const result = await resolveEntitySlugWithSource(
+      engine as unknown as BrainEngine,
+      'default',
+      'data-claude-conventions',
+    );
+    expect(result!.slug).toBe('data-claude-conventions');
+    expect(result!.source).toBe<ResolutionSource>('fallback_slugify');
+  });
+
+  it('tags unknown-directory comms- hyphen-prefix as fallback_slugify (workspace-l5o.36)', async () => {
+    // Bead AC named `comms-` as a prefix to expand, but `comms/` isn't
+    // a brain directory. Pin the fall-through so a future codex pass
+    // can't reframe this as a bug. Tracked in workspace-l5o.36 for
+    // extractor-side fix.
+    const result = await resolveEntitySlugWithSource(
+      engine as unknown as BrainEngine,
+      'default',
+      'comms-eval-mjs',
+    );
+    expect(result!.slug).toBe('comms-eval-mjs');
+    expect(result!.source).toBe<ResolutionSource>('fallback_slugify');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// workspace-i75 codex P2 — structural invariants
+// ─────────────────────────────────────────────────────────────────────
+
+describe('HYPHEN_PREFIX_REWRITE_SORTED — sort invariant', () => {
+  it('sorts directories by descending length (greedy-longest-first)', () => {
+    for (let i = 1; i < HYPHEN_PREFIX_REWRITE_SORTED.length; i++) {
+      expect(HYPHEN_PREFIX_REWRITE_SORTED[i - 1].length).toBeGreaterThanOrEqual(
+        HYPHEN_PREFIX_REWRITE_SORTED[i].length,
+      );
+    }
+  });
+
+  it('contains the known set of brain directories', () => {
+    // Spot-check a few — full list is in resolve.ts. If a directory gets
+    // added to /data/brain and warrants hyphen-prefix rewrite, also add
+    // it to HYPHEN_PREFIX_REWRITE_DIRS.
+    expect(HYPHEN_PREFIX_REWRITE_SORTED).toContain('people');
+    expect(HYPHEN_PREFIX_REWRITE_SORTED).toContain('companies');
+    expect(HYPHEN_PREFIX_REWRITE_SORTED).toContain('personal');
+  });
+});
+
+describe('resolveEntitySlug — collision boundary (codex P2#3)', () => {
+  it('rewrites "people-organizations" via expansion when no exact match exists', async () => {
+    // Fixture: NO `people/organizations` page, but `people/organizations-foo`
+    // does exist. Pins that when the exact-slug path misses, the
+    // expansion path (people/organizations-%) is tried before giving up.
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'people-organizations');
+    expect(result).toBe('people/organizations-foo');
+  });
+
+  it('rewrites a multi-hyphen rest via exact match on the slash form', async () => {
+    // dir=personal, rest=reflections-foo → exact match on personal/reflections-foo.
+    // This is the case that motivated the greedy-longest-first design:
+    // if `personal-reflections/` ever becomes a registered dir, the sort
+    // invariant guarantees `personal-reflections/foo` wins over
+    // `personal/reflections-foo`. Today, only `personal/` is registered,
+    // so the rewrite picks the exact `personal/reflections-foo`.
+    const result = await resolveEntitySlug(engine as unknown as BrainEngine, 'default', 'personal-reflections-foo');
+    expect(result).toBe('personal/reflections-foo');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// workspace-i75 codex P2#2 — empirical-coverage regression fixture
+// ─────────────────────────────────────────────────────────────────────
+//
+// Top-frequency unique slugs from ~/.gbrain/audit/stub-guard-2026-W21.jsonl
+// captured at workspace-i75 fix time (166 lines / 24h on the cockpit).
+// Each entry pins the expected resolution path:
+//   - rewrite_hit: hyphen-prefix-rewrite finds a real page (test fixture has it)
+//   - rewrite_miss: hyphen-prefix-rewrite tried but found nothing (falls through)
+//   - fallback_slugify: no rewrite possible (dir not in HYPHEN_PREFIX_REWRITE_DIRS, or no hyphen)
+//
+// When the production resolver drifts, this list surfaces the regression.
+// New top-frequency slugs from future audit log captures should be added
+// (with their classification) as part of any change touching resolve.ts.
+const AUDIT_LOG_FIXTURE: ReadonlyArray<{
+  input: string;
+  expected_path: 'rewrite_hit' | 'rewrite_miss' | 'fallback_slugify';
+  expected_source: ResolutionSource;
+}> = [
+  // Top 5 hits from the W21 audit log
+  { input: 'people-alice',            expected_path: 'rewrite_hit',      expected_source: 'fuzzy_match' },        // proxy for people-ben (43 hits) — fixture has alice-example
+  { input: 'data-claude-conventions', expected_path: 'fallback_slugify', expected_source: 'fallback_slugify' },   // 14 hits — no data/ dir
+  { input: 'comms-eval-mjs',          expected_path: 'fallback_slugify', expected_source: 'fallback_slugify' },   // 5 hits — no comms/ dir
+  { input: 'companies-stripe',        expected_path: 'rewrite_hit',      expected_source: 'fuzzy_match' },        // proxy for companies-palantir (3) — fixture has stripe
+  // Mid-frequency hits
+  { input: 'evals-discovery',         expected_path: 'fallback_slugify', expected_source: 'fallback_slugify' },   // 3 hits — no evals/ dir
+  { input: 'session-057491b8',        expected_path: 'rewrite_miss',     expected_source: 'fallback_slugify' },   // 2 hits — sessions/ would match but `session/` (singular) is NOT registered, and `session/` isn't in /data/brain anyway
+  // Bare-slug cases (no hyphen-prefix-rewrite applicable)
+  { input: 'brainops',                expected_path: 'fallback_slugify', expected_source: 'fallback_slugify' },   // bare slug, no hyphen
+  { input: 'vanta',                   expected_path: 'fallback_slugify', expected_source: 'fallback_slugify' },   // bare slug, no hyphen
+];
+
+describe('resolveEntitySlug — empirical audit-log coverage (codex P2#2)', () => {
+  for (const fixture of AUDIT_LOG_FIXTURE) {
+    it(`pins resolution path for ${fixture.input} (${fixture.expected_path})`, async () => {
+      const result = await resolveEntitySlugWithSource(
+        engine as unknown as BrainEngine,
+        'default',
+        fixture.input,
+      );
+      expect(result).not.toBeNull();
+      expect(result!.source).toBe<ResolutionSource>(fixture.expected_source);
+
+      if (fixture.expected_path === 'fallback_slugify') {
+        // Falls through to slugify — input unchanged (already lowercase-hyphen).
+        expect(result!.slug).toBe(fixture.input);
+      } else if (fixture.expected_path === 'rewrite_miss') {
+        // Rewrite was attempted but found nothing; same slugify fall-through.
+        expect(result!.slug).toBe(fixture.input);
+      } else {
+        // rewrite_hit: must contain a slash (real page slug shape).
+        expect(result!.slug).toContain('/');
+      }
+    });
+  }
 });
 
 describe('slugify', () => {
