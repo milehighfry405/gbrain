@@ -2,6 +2,10 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [Unreleased]
+
+- `gateway.chat()` now consumes `chat_fallback_chain` on retry-worthy errors (5xx / 429 / network / timeout — `AITransientError`). Opt-in: behavior is unchanged unless an operator sets `chat_fallback_chain` in config. 4xx auth and `model_not_found` (`AIConfigError`) still surface immediately so config drift isn't masked. Budget tracker reserves + records per attempt; `ChatResult.model` reports the model that actually answered. Telemetry: `chat.fallback.fired` line on stderr when a fallback wins.
+
 ## [0.40.2.0] - 2026-05-22
 
 **gbrain now uses the typed-claim timeline it's been quietly building to ground answers about what changed and when.** Ask `gbrain think` "when did Marco last switch jobs" or "what was the ARR in March" and the answer comes back rooted in a real chronological timeline of the metric facts your brain already extracted via the `extract_facts` cycle phase. The feature is on by default; flip `think.trajectory_enabled=false` to opt out.
