@@ -299,11 +299,13 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   // before the queue piles up.
   const NO_WORKER_WARN_TICKS = 3;
   let noWorkerConsecutiveIdle = 0;
-  // v0.36+ T8: track time since last full cycle for the 60-min floor.
-  // Initialized to "long ago" so the first tick on a healthy brain still
-  // runs the full cycle (phase-coupling exercise) before settling into
-  // targeted-submit mode.
-  let lastFullCycleAt = 0;
+  // workspace-l5o.20: removed process-local `lastFullCycleAt`. The
+  // canonical freshness signal is per-source `last_full_cycle_at` in
+  // `sources.config` JSONB (read via `isSourceStale` inside
+  // `decideDispatchMode`). The pre-fix process-local watermark reset
+  // on every daemon restart, AND a healthy brain in the 70<=score<95
+  // band with empty plan never satisfied any clause of the gate, so
+  // `doctor:cycle_freshness` stayed FAILed forever.
 
   while (!stopping) {
     const cycleStart = Date.now();
@@ -436,17 +438,20 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         const plan = computeRecommendations(health, ctx).filter((r) => r.status === 'remediable');
         const estTotal = plan.reduce((s, r) => s + r.est_seconds, 0);
 
-        // Track time since last full cycle for the 60-min floor.
-        const FULL_CYCLE_FLOOR_MIN = 60;
-        const minutesSinceLastFull = (Date.now() - lastFullCycleAt) / 60000;
-
-        const shouldFullCycle =
-          (score >= 95 && plan.length === 0 && minutesSinceLastFull >= FULL_CYCLE_FLOOR_MIN) ||
-          plan.length > 3 ||
-          estTotal >= 300 ||
-          score < 70;
-
-        const shouldSleep = score >= 95 && plan.length === 0 && minutesSinceLastFull < FULL_CYCLE_FLOOR_MIN;
+        // workspace-l5o.20: per-source-freshness-first dispatch gate.
+        // Read sources up front so `decideDispatchMode` can consult
+        // per-source `last_full_cycle_at` watermarks; a thrown
+        // `listAllSources` (pre-v0.18 brain / engine misconfig) yields
+        // an empty array and falls into the legacy/sleep path, mirroring
+        // `dispatchPerSource`'s own error contract.
+        const { decideDispatchMode, dispatchPerSource, resolveFanoutMax } = await import('./autopilot-fanout.ts');
+        const sourcesForGate = await engine.listAllSources({ localPathOnly: true }).catch(() => []);
+        const { shouldFullCycle, shouldSleep } = decideDispatchMode({
+          sources: sourcesForGate,
+          plan,
+          estTotalSec: estTotal,
+          brainScore: score,
+        });
 
         if (shouldSleep) {
           if (jsonMode) {
@@ -461,7 +466,9 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
           // codex P1-3). Fresh-install brains with no sources rows fall
           // back to the legacy single autopilot-cycle so existing
           // behavior is preserved.
-          const { dispatchPerSource, resolveFanoutMax } = await import('./autopilot-fanout.ts');
+          //
+          // workspace-l5o.20: `dispatchPerSource` + `resolveFanoutMax`
+          // are now imported up at the gate (alongside `decideDispatchMode`).
           const fanoutMax = await resolveFanoutMax(engine);
           const result = await dispatchPerSource(engine, queue, {
             repoPath,
@@ -470,9 +477,13 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
             fanoutMax,
             jsonMode,
           });
-          if (result.dispatched.length > 0 || result.legacy_fallback) {
-            lastFullCycleAt = Date.now();
-          }
+          // workspace-l5o.20: removed the process-local watermark
+          // assignment that lived here pre-fix — per-source
+          // `last_full_cycle_at` watermarks (written in `cycle.ts:1730`)
+          // are the canonical freshness signal; the outer gate consults
+          // them via `decideDispatchMode` next tick. The wiring test
+          // greps autopilot.ts for the legacy pattern, so phrasing
+          // here avoids re-introducing it as a substring.
           if (jsonMode) {
             process.stderr.write(JSON.stringify({
               event: 'fanout_summary',

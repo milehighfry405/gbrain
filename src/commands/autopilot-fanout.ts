@@ -112,6 +112,60 @@ export function isSourceStale(src: SourceRow, now = Date.now(), floorMin = FULL_
 }
 
 /**
+ * Decide the per-tick dispatch mode. Pure function so tests can exercise
+ * the full-cycle / sleep / targeted-submit gate matrix without an engine.
+ *
+ * workspace-l5o.20 fix: the pre-fix gate in `autopilot.ts` keyed off a
+ * process-local `lastFullCycleAt` + `brain_score` band. On a healthy
+ * Postgres+Minions brain with `70 <= score < 95` and a small plan, NONE
+ * of the gate's clauses fired AND `shouldSleep` was false either, so
+ * control fell through to the targeted-submit branch which never
+ * dispatched `autopilot-cycle` and never wrote `last_full_cycle_at`
+ * watermarks → `doctor:cycle_freshness` FAILed forever.
+ *
+ * The new gate is per-source-freshness-first: any stale source forces a
+ * full cycle, regardless of brain score. The score/plan-based escape
+ * hatches (score < 70, plan > 3, estTotal >= 300) are preserved as the
+ * "unhealthy brain still hammers" path. `shouldSleep` triggers only
+ * when all sources are fresh AND the plan is empty AND the brain isn't
+ * below the score floor (an unhealthy brain has no business sleeping —
+ * see lead-decided case 4 below).
+ *
+ * Note: an empty `sources` array (legacy / fresh-install brain) yields
+ * `anyStaleSource=false`. The outer gate should sleep when the plan is
+ * also empty and the score is healthy; `dispatchPerSource`'s own
+ * legacy fallback covers the brain-needs-bootstrap case when the gate
+ * DOES fire (via plan or score).
+ *
+ * Lead-decided shouldSleep refinement (see workspace-l5o.20 spec
+ * case 4): lead's prose said `shouldSleep = !anyStaleSource &&
+ * plan.length === 0`, but lead's case 4 (`all fresh + brainScore=50 →
+ * shouldSleep: false`) requires the score gate too. Implemented per
+ * case-list, which preserves the pre-fix invariant "unhealthy brain
+ * never sleeps". Flagged for lead reconciliation in the report.
+ */
+export function decideDispatchMode(args: {
+  sources: SourceRow[];
+  plan: { length: number };
+  estTotalSec: number;
+  brainScore: number;
+  now?: number;
+  floorMin?: number;
+}): { shouldFullCycle: boolean; shouldSleep: boolean; anyStaleSource: boolean } {
+  const now = args.now ?? Date.now();
+  const floorMin = args.floorMin ?? FULL_CYCLE_FLOOR_MIN;
+  const anyStaleSource = args.sources.some((s) => isSourceStale(s, now, floorMin));
+  const shouldFullCycle =
+    anyStaleSource ||
+    args.plan.length > 3 ||
+    args.estTotalSec >= 300 ||
+    args.brainScore < 70;
+  const shouldSleep =
+    !anyStaleSource && args.plan.length === 0 && args.brainScore >= 70;
+  return { shouldFullCycle, shouldSleep, anyStaleSource };
+}
+
+/**
  * Decide which sources to dispatch this tick. Pure function so tests can
  * exercise the freshness gate + cap math without an engine.
  *

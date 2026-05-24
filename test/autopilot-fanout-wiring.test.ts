@@ -45,10 +45,21 @@ describe('autopilot.ts ↔ dispatchPerSource wiring', () => {
     expect(Math.abs(dispatchIdx - fullCycleIdx)).toBeLessThan(3000);
   });
 
-  test('updates lastFullCycleAt on dispatch (so the 60-min floor is honored)', () => {
-    // After the dispatchPerSource call, the lastFullCycleAt module var
-    // must update so the next tick doesn't immediately re-fan-out.
-    expect(AUTOPILOT_SRC).toMatch(/lastFullCycleAt\s*=\s*Date\.now\(\)/);
+  test('gates dispatch on decideDispatchMode (per-source freshness, not process-local watermark)', () => {
+    // workspace-l5o.20: the pre-fix gate keyed on a process-local
+    // `lastFullCycleAt` + brain_score band. On a healthy
+    // Postgres+Minions brain in [70, 95) with empty plan, NONE of the
+    // clauses fired AND shouldSleep was false, so dispatchPerSource
+    // never ran and `last_full_cycle_at` watermarks never advanced →
+    // `doctor:cycle_freshness` FAILed forever. Fix replaces the inline
+    // gate with `decideDispatchMode` (pure fn in autopilot-fanout.ts)
+    // that consults per-source `isSourceStale`. This test pins the
+    // wiring so a future refactor that reverts to a process-local
+    // watermark fails here first.
+    expect(AUTOPILOT_SRC).toMatch(/decideDispatchMode/);
+    // And the legacy process-local var must NOT come back.
+    expect(AUTOPILOT_SRC).not.toMatch(/let\s+lastFullCycleAt\s*=/);
+    expect(AUTOPILOT_SRC).not.toMatch(/lastFullCycleAt\s*=\s*Date\.now\(\)/);
   });
 
   test('does NOT regress to the single-job dispatch on the full-cycle path', () => {
