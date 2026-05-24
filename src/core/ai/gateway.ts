@@ -48,7 +48,7 @@ import { resolveRecipe, assertTouchpoint, parseModelId } from './model-resolver.
 import { resolveModel, TIER_DEFAULTS } from '../model-config.ts';
 import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
-import { AIConfigError, AITransientError, normalizeAIError } from './errors.ts';
+import { AIConfigError, AIServiceError, AITransientError, normalizeAIError } from './errors.ts';
 
 const MAX_CHARS = 8000;
 // v0.36.0.0 (D3 + D4): ZeroEntropy zembed-1 at 1280d via Matryoshka is the
@@ -2172,20 +2172,78 @@ function mapStopReason(
  *
  * Crash-resumable replay is the caller's responsibility (subagent.ts persists
  * blocks via the provider-neutral schema landing in commit 2a).
+ *
+ * Provider fallback (workspace-l5o.23, opt-in): when the configured
+ * `chat_fallback_chain` is non-empty, retry-worthy errors from the primary
+ * model (network/timeout/5xx/429 → `AITransientError`) fall through to the
+ * next provider in the chain. Config-class errors (`AIConfigError` — 4xx
+ * auth/model_not_found) do NOT trigger fallback because they are operator
+ * bugs that swapping providers would mask. Budget tracker reserve+record
+ * runs per attempt so spend on the failed primary is still accounted.
  */
 export async function chat(opts: ChatOpts): Promise<ChatResult> {
   const tracker = __budgetStore.getStore() ?? null;
-  const modelStrEarly = opts.model ?? getChatModel();
+  const primaryModel = opts.model ?? getChatModel();
   const estimatedInputTokens = estimateChatInputTokens(opts);
   const maxOutputTokens = opts.maxTokens ?? 4096;
 
+  const fallbackChain = getChatFallbackChain();
+  const attempts: string[] = [primaryModel];
+  for (const m of fallbackChain) {
+    if (!attempts.includes(m)) attempts.push(m);
+  }
+
+  let lastErr: unknown = null;
+  for (let i = 0; i < attempts.length; i++) {
+    const modelStr = attempts[i];
+    const isFallback = i > 0;
+    try {
+      const res = await _chatOnce(
+        modelStr,
+        opts,
+        tracker,
+        estimatedInputTokens,
+        maxOutputTokens,
+      );
+      if (isFallback) {
+        process.stderr.write(
+          `[gateway.chat] chat.fallback.fired: primary=${primaryModel} fallback=${modelStr} attempt=${i + 1}/${attempts.length}\n`,
+        );
+      }
+      return res;
+    } catch (err) {
+      lastErr = err;
+      // Only AITransientError is retry-worthy (5xx / 429 / timeouts /
+      // network). AIConfigError (4xx auth + model_not_found) and
+      // BudgetExhausted are not — they're operator bugs or hard caps.
+      if (!(err instanceof AITransientError)) throw err;
+      // No more attempts left — surface the last transient error.
+      if (i === attempts.length - 1) throw err;
+    }
+  }
+  throw lastErr ?? new Error('chat(): no attempts ran');
+}
+
+/**
+ * One attempt against a single `modelStr`. Owns its own budget reserve +
+ * record so fallback retries accumulate spend correctly. Test transport
+ * (`__setChatTransportForTests`) short-circuits provider resolution but
+ * still flows through this seam so fallback tests see the same accounting.
+ */
+async function _chatOnce(
+  modelStr: string,
+  opts: ChatOpts,
+  tracker: BudgetTracker | null,
+  estimatedInputTokens: number,
+  maxOutputTokens: number,
+): Promise<ChatResult> {
   // TX5: reserve BEFORE the provider call. Throws BudgetExhausted on cost,
   // runtime, or no_pricing (when cap is set). Pre-resolution model id is
   // fine here — resolveChatProvider would map aliases the same way for the
   // cost lookup. record() below uses the real result.model.
   if (tracker) {
     tracker.reserve({
-      modelId: modelStrEarly,
+      modelId: modelStr,
       estimatedInputTokens,
       maxOutputTokens,
       kind: 'chat' as BudgetKind,
@@ -2196,21 +2254,33 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
   // Test seam: when a test transport is installed, route through it without
   // touching provider resolution, AI SDK, or any network. See
   // __setChatTransportForTests. Production paths see _chatTransport === null.
+  // The per-attempt `modelStr` is threaded into opts so fallback tests can
+  // branch transport behavior on which model is being attempted.
   if (_chatTransport) {
+    const transportOpts: ChatOpts = { ...opts, model: modelStr };
     let res: ChatResult | null = null;
     let threw: unknown = null;
     try {
-      res = await _chatTransport(opts);
+      res = await _chatTransport(transportOpts);
       return res;
     } catch (err) {
       threw = err;
-      throw err;
+      // Test transports re-throw whatever the test specified. Pass-through
+      // for AIServiceError (the gateway's own taxonomy) and SDK/network-
+      // shaped errors normalizeAIError knows how to classify; everything
+      // else (TypeError, RangeError, bun:test assertion failures, raw
+      // strings, etc.) propagates as-is so genuine test bugs surface
+      // instead of being silently converted into a retryable
+      // AITransientError that would fire fallback and mask the failure.
+      throw _isProviderShapedError(err)
+        ? normalizeAIError(err, `chat(${modelStr})`)
+        : err;
     } finally {
       if (tracker) {
         try {
           if (res) {
             tracker.record({
-              modelId: res.model ?? modelStrEarly,
+              modelId: res.model ?? modelStr,
               inputTokens: res.usage.input_tokens,
               outputTokens: res.usage.output_tokens,
               label: 'gateway.chat',
@@ -2221,7 +2291,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
               outputTokens: maxOutputTokens,
             });
             tracker.record({
-              modelId: modelStrEarly,
+              modelId: modelStr,
               inputTokens: usage.inputTokens,
               outputTokens: usage.outputTokens,
               label: 'gateway.chat',
@@ -2237,7 +2307,71 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
     }
   }
 
-  const modelStr = modelStrEarly;
+  // Production path. Wrap resolveChatProvider + the AI SDK call together in
+  // try/finally so a reserved-but-never-recorded reservation can't leak when
+  // resolution itself throws (e.g. AIConfigError for unknown recipe / model
+  // not declared in the recipe). Pre-resolution failures record a
+  // pessimistic-fallback usage under `modelStr` so the tracker sees the
+  // accounting symmetric with reserve(). The post-resolution paths overwrite
+  // _budgetRecorded with the real (or post-error) numbers.
+  let _budgetRecorded = false;
+  const _recordBudget = (modelLabel: string, inputTokens: number, outputTokens: number): void => {
+    if (!tracker || _budgetRecorded) return;
+    _budgetRecorded = true;
+    try {
+      tracker.record({
+        modelId: modelLabel,
+        inputTokens,
+        outputTokens,
+        label: 'gateway.chat',
+      });
+    } catch {
+      // BudgetExhausted (TX1) raised here; surface via next reserve()
+    }
+  };
+
+  try {
+    return await _chatOnceProduction(modelStr, opts, _recordBudget);
+  } finally {
+    // Reserve/record symmetry guarantee: if no record() ran (e.g.
+    // resolveChatProvider threw before the inner try/catch could fire),
+    // charge the pessimistic ceiling so the reservation isn't orphaned.
+    if (!_budgetRecorded && tracker) {
+      const fallback = _extractUsageFromError(null, {
+        inputTokens: estimatedInputTokens,
+        outputTokens: maxOutputTokens,
+      });
+      _recordBudget(modelStr, fallback.inputTokens, fallback.outputTokens);
+    }
+  }
+}
+
+/** Whether `err` looks like a provider/SDK/network error normalizeAIError can
+ * meaningfully classify. Programmer errors (TypeError, RangeError, assertion
+ * failures, raw strings) fall through unchanged so test bugs aren't masked
+ * by silent conversion into a retryable AITransientError. */
+function _isProviderShapedError(err: unknown): boolean {
+  if (err instanceof AIServiceError) return true;
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { name?: unknown; status?: unknown; statusCode?: unknown };
+  // Status-bearing: any HTTP-style error from an SDK or fetch wrapper.
+  if (typeof e.status === 'number' || typeof e.statusCode === 'number') return true;
+  // Vercel AI SDK named errors normalizeAIError knows.
+  if (e.name === 'LoadAPIKeyError' || e.name === 'InvalidArgumentError') return true;
+  // Anything else (TypeError, ReferenceError, plain Error from a test stub
+  // without a status, bun:test assertion errors) is left unchanged.
+  return false;
+}
+
+/** Production-path body of _chatOnce, factored out so the surrounding
+ * try/finally in the caller covers resolveChatProvider too. */
+async function _chatOnceProduction(
+  modelStr: string,
+  opts: ChatOpts,
+  _recordBudget: (modelLabel: string, inputTokens: number, outputTokens: number) => void,
+): Promise<ChatResult> {
+  const estimatedInputTokens = estimateChatInputTokens(opts);
+  const maxOutputTokens = opts.maxTokens ?? 4096;
   const { model, recipe, modelId } = await resolveChatProvider(modelStr);
 
   const supportsCache = recipe.touchpoints.chat?.supports_prompt_cache === true;
@@ -2258,22 +2392,6 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
   if (useCache) {
     providerOptions.anthropic = { cacheControl: { type: 'ephemeral' } };
   }
-
-  let _budgetRecorded = false;
-  const _recordBudget = (modelLabel: string, inputTokens: number, outputTokens: number): void => {
-    if (!tracker || _budgetRecorded) return;
-    _budgetRecorded = true;
-    try {
-      tracker.record({
-        modelId: modelLabel,
-        inputTokens,
-        outputTokens,
-        label: 'gateway.chat',
-      });
-    } catch {
-      // BudgetExhausted (TX1) raised here; surface via next reserve()
-    }
-  };
 
   try {
     const result = await generateText({
