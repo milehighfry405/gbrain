@@ -136,15 +136,15 @@ describe('splitTranscriptByBudget — D9 hash-deterministic identity', () => {
 
 describe('rewriteChunkedSlug — D6 zero-Sonnet-trust slug rewrite', () => {
   test('appends -c<idx> when slug ends with bare hash6', () => {
-    expect(rewriteChunkedSlug('wiki/originals/ideas/2026-05-08-thesis-abc123', 'abc123', 0))
-      .toBe('wiki/originals/ideas/2026-05-08-thesis-abc123-c0');
-    expect(rewriteChunkedSlug('wiki/personal/reflections/2026-05-08-foo-deadbe', 'deadbe', 2))
-      .toBe('wiki/personal/reflections/2026-05-08-foo-deadbe-c2');
+    expect(rewriteChunkedSlug('originals/ideas/2026-05-08-thesis-abc123', 'abc123', 0))
+      .toBe('originals/ideas/2026-05-08-thesis-abc123-c0');
+    expect(rewriteChunkedSlug('personal/reflections/2026-05-08-foo-deadbe', 'deadbe', 2))
+      .toBe('personal/reflections/2026-05-08-foo-deadbe-c2');
   });
 
   test('passes through when slug already correctly chunk-suffixed', () => {
-    expect(rewriteChunkedSlug('wiki/originals/ideas/2026-05-08-thesis-abc123-c0', 'abc123', 0))
-      .toBe('wiki/originals/ideas/2026-05-08-thesis-abc123-c0');
+    expect(rewriteChunkedSlug('originals/ideas/2026-05-08-thesis-abc123-c0', 'abc123', 0))
+      .toBe('originals/ideas/2026-05-08-thesis-abc123-c0');
     expect(rewriteChunkedSlug('foo-bar-deadbe-c5', 'deadbe', 5))
       .toBe('foo-bar-deadbe-c5');
   });

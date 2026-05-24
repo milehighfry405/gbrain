@@ -158,7 +158,7 @@ context fed to each chapter subagent.
    (gbrain ships templates at `templates/USER.md` and `templates/SOUL.md`;
    they live in the brain repo when populated). Read full.
 2. **Recent daily memory** — last 14 days of brain pages under
-   `wiki/personal/reflections/` or wherever the user files daily notes.
+   `personal/reflections/` or wherever the user files daily notes.
 3. **Topic-relevant brain searches** tuned to the book's themes:
    - `gbrain query "marriage"`, `gbrain query "couples therapy"` for a
      marriage book.

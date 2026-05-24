@@ -209,7 +209,7 @@ describe('self-consumption guard (v0.23.2 marker-based)', () => {
     // fires. Codex finding #5: synthetic-string fixtures don't prove the guard
     // catches what the synthesize phase actually produces.
     const page = {
-      slug: 'wiki/personal/reflections/2026-04-30-test-abc123',
+      slug: 'personal/reflections/2026-04-30-test-abc123',
       type: 'reflection' as const,
       title: 'Test reflection',
       compiled_truth: 'I learned something about [Alice](people/alice). No own-slug citation in body.',
@@ -226,7 +226,7 @@ describe('self-consumption guard (v0.23.2 marker-based)', () => {
     // The exact false-positive case codex finding #1 named: a user note that
     // legitimately mentions a reflection slug in plain text. Must NOT be skipped.
     const path = makeTranscript('convo.txt',
-      'User: tell me about wiki/personal/reflections/identity-foo and how it relates to my work.\n' +
+      'User: tell me about personal/reflections/identity-foo and how it relates to my work.\n' +
       'Agent: ' + 'x'.repeat(3000));
     const result = readSingleTranscript(path, { minChars: 100 });
     expect(result).not.toBeNull();

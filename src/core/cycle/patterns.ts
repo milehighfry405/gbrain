@@ -174,7 +174,7 @@ async function gatherReflections(
   const rows = await engine.executeRaw<{ slug: string; title: string | null; compiled_truth: string | null }>(
     `SELECT slug, title, compiled_truth
        FROM pages
-      WHERE slug LIKE 'wiki/personal/reflections/%'
+      WHERE slug LIKE 'personal/reflections/%'
         AND updated_at >= $1::timestamptz
       ORDER BY updated_at DESC
       LIMIT 100`,
@@ -199,15 +199,15 @@ function buildPatternsPrompt(reflections: ReflectionRef[], minEvidence: number):
 
 OUTPUT POLICY
 - Only name a pattern if it appears in at least ${minEvidence} DISTINCT reflections.
-- Each pattern page MUST cite the reflections that constitute its evidence (use [[wiki/personal/reflections/...]] wikilinks).
+- Each pattern page MUST cite the reflections that constitute its evidence (use [[personal/reflections/...]] wikilinks).
 - Use \`search\` to check whether a similar pattern page already exists; if yes, update it (use the same slug). If no, create a new one.
-- Pattern slug format: \`wiki/personal/patterns/<topic-slug>\` (lowercase alphanumeric + hyphens; no underscores, no extension, no date).
+- Pattern slug format: \`personal/patterns/<topic-slug>\` (lowercase alphanumeric + hyphens; no underscores, no extension, no date).
 - A "pattern" is a recurring theme, anxiety, decision pattern, relationship dynamic, or self-knowledge motif. NOT a single insight. NOT a list of unrelated topics.
 
 DO NOT WRITE
 - A "patterns from today" digest (that's the dream-cycle-summaries page; not your job).
 - Patterns with <${minEvidence} reflections cited.
-- Anything outside wiki/personal/patterns/.
+- Anything outside personal/patterns/.
 
 CONTEXT
 - Today: ${today}
