@@ -100,7 +100,7 @@ describe('chat_fallback_chain — retry-worthy errors fall through', () => {
     expect(res.text).toBe('ok');
   });
 
-  test('network/timeout error (normalized to AITransientError) falls through', async () => {
+  test('network/timeout error (status 502) falls through to next provider', async () => {
     configureGateway({
       chat_model: 'anthropic:claude-sonnet-4-6',
       chat_fallback_chain: ['google:gemini-2.5-pro'],
@@ -111,9 +111,11 @@ describe('chat_fallback_chain — retry-worthy errors fall through', () => {
     __setChatTransportForTests(async (opts) => {
       seen.push(opts.model ?? 'unknown');
       if (opts.model === 'anthropic:claude-sonnet-4-6') {
-        // Raw thrown Error → normalizeAIError() wraps as AITransientError
-        // (5xx default), which is what AI SDK gives us on network failures.
-        const err = new Error('ECONNRESET');
+        // Mirrors AI SDK error shape for upstream 5xx — has a numeric
+        // `status`, so the provider-shaped whitelist normalizes to
+        // AITransientError and triggers fallback.
+        const err: Error & { status?: number } = new Error('Bad Gateway');
+        err.status = 502;
         throw err;
       }
       return successResult('google:gemini-2.5-pro');
@@ -314,6 +316,127 @@ describe('chat_fallback_chain — opt-in semantics', () => {
     expect(seen).toEqual(['anthropic:claude-sonnet-4-6', 'openai:gpt-5']);
     expect(res.model).toBe('openai:gpt-5');
   });
+
+  test('dedupe is EXACT-STRING only — provider-prefixed and bare alias attempt twice', async () => {
+    // Pins the current contract (P2 advisory from codex review of l5o.23):
+    // attempts.includes() is an exact-string compare, so the same underlying
+    // model expressed two different ways (e.g. one bare alias, one fully
+    // qualified provider:model) is NOT deduped. If you want alias-aware
+    // dedupe, that's resolveChatProvider-level work — file a follow-up bead
+    // when a real user trips on it, don't pre-build it here.
+    configureGateway({
+      chat_model: 'anthropic:claude-sonnet-4-6',
+      // 'claude-sonnet-4-6' (bare) and 'anthropic:claude-sonnet-4-6'
+      // (prefixed) resolve to the same provider/model in production, but as
+      // strings they differ. Test transport sees them as distinct.
+      chat_fallback_chain: ['claude-sonnet-4-6', 'openai:gpt-5'],
+      env: { ANTHROPIC_API_KEY: 'sk-x', OPENAI_API_KEY: 'sk-x' },
+    });
+
+    const seen: string[] = [];
+    __setChatTransportForTests(async (opts) => {
+      seen.push(opts.model ?? '');
+      if (opts.model === 'openai:gpt-5') return successResult('openai:gpt-5');
+      throw new AITransientError('boom');
+    });
+
+    const res = await chat(makeOpts());
+    // Both string forms attempted (exact-string semantics), then openai
+    // succeeds. If a future change adds alias-aware dedupe, this test
+    // breaks loudly + the reader sees the contract change in the diff.
+    expect(seen).toEqual([
+      'anthropic:claude-sonnet-4-6',
+      'claude-sonnet-4-6',
+      'openai:gpt-5',
+    ]);
+    expect(res.model).toBe('openai:gpt-5');
+  });
+});
+
+describe('chat_fallback_chain — programmer errors are not retryable', () => {
+  test('TypeError from a test transport propagates as TypeError (no fallback)', async () => {
+    // P2 advisory from codex review: errors that aren't provider/SDK shaped
+    // (no status, no known AI SDK error name, not AIServiceError) must NOT
+    // be silently normalized into AITransientError — that would convert a
+    // genuine test bug into a fallback that obscures the failure. Pin the
+    // pass-through contract.
+    configureGateway({
+      chat_model: 'anthropic:claude-sonnet-4-6',
+      chat_fallback_chain: ['openai:gpt-5'],
+      env: { ANTHROPIC_API_KEY: 'sk-x', OPENAI_API_KEY: 'sk-x' },
+    });
+
+    const seen: string[] = [];
+    __setChatTransportForTests(async (opts) => {
+      seen.push(opts.model ?? '');
+      if (opts.model === 'anthropic:claude-sonnet-4-6') {
+        throw new TypeError("Cannot read properties of undefined (reading 'foo')");
+      }
+      return successResult('openai:gpt-5');
+    });
+
+    let caught: unknown = null;
+    try {
+      await chat(makeOpts());
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(TypeError);
+    expect((caught as Error).message).toContain('Cannot read properties');
+    // Fallback MUST NOT have fired — the test bug stays visible.
+    expect(seen).toEqual(['anthropic:claude-sonnet-4-6']);
+  });
+
+  test('plain Error without status propagates unchanged (no fallback)', async () => {
+    configureGateway({
+      chat_model: 'anthropic:claude-sonnet-4-6',
+      chat_fallback_chain: ['openai:gpt-5'],
+      env: { ANTHROPIC_API_KEY: 'sk-x', OPENAI_API_KEY: 'sk-x' },
+    });
+
+    const seen: string[] = [];
+    __setChatTransportForTests(async (opts) => {
+      seen.push(opts.model ?? '');
+      if (opts.model === 'anthropic:claude-sonnet-4-6') {
+        throw new Error('assertion failed: expected x to be y');
+      }
+      return successResult('openai:gpt-5');
+    });
+
+    let caught: unknown = null;
+    try {
+      await chat(makeOpts());
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(AITransientError);
+    expect((caught as Error).message).toContain('assertion failed');
+    expect(seen).toEqual(['anthropic:claude-sonnet-4-6']);
+  });
+
+  test('Error with status:500 IS normalized + IS retried (provider-shaped)', async () => {
+    // Counter-pin: the whitelist must still admit SDK-shaped errors. A raw
+    // Error carrying a numeric `status` (the shape AI SDK gives us on 5xx)
+    // gets normalized → AITransientError → fallback fires.
+    configureGateway({
+      chat_model: 'anthropic:claude-sonnet-4-6',
+      chat_fallback_chain: ['openai:gpt-5'],
+      env: { ANTHROPIC_API_KEY: 'sk-x', OPENAI_API_KEY: 'sk-x' },
+    });
+
+    __setChatTransportForTests(async (opts) => {
+      if (opts.model === 'anthropic:claude-sonnet-4-6') {
+        const err: Error & { status?: number } = new Error('Internal Server Error');
+        err.status = 500;
+        throw err;
+      }
+      return successResult('openai:gpt-5');
+    });
+
+    const res = await chat(makeOpts());
+    expect(res.model).toBe('openai:gpt-5');
+  });
 });
 
 describe('chat_fallback_chain — budget tracker bookkeeping', () => {
@@ -353,6 +476,45 @@ describe('chat_fallback_chain — budget tracker bookkeeping', () => {
     // recorded under the answering model from ChatResult.model.
     expect(recordedModels).toContain('anthropic:claude-sonnet-4-6');
     expect(recordedModels).toContain('anthropic:claude-haiku-4-5-20251001');
+  });
+});
+
+describe('chat_fallback_chain — reserve/record symmetry on production-path failure', () => {
+  test('resolveChatProvider failure after reserve still records (no leaked reservation)', async () => {
+    // P2 advisory from codex review of l5o.23: when resolveChatProvider
+    // throws AFTER reserve() but BEFORE the inner try/catch could fire (e.g.
+    // missing API key, unknown model alias), the outer try/finally in
+    // _chatOnce must still record a pessimistic-fallback usage so the
+    // reservation isn't orphaned in the budget tracker's audit log.
+    //
+    // No test transport here — we exercise the real production path with a
+    // config that's guaranteed to fail at instantiateChat() (missing
+    // ANTHROPIC_API_KEY).
+    configureGateway({
+      chat_model: 'anthropic:claude-sonnet-4-6',
+      env: {}, // no API key → instantiateChat throws AIConfigError
+    });
+    __setChatTransportForTests(null);
+
+    const tracker = new BudgetTracker({ maxCostUsd: 1.0, label: 'symmetry-test', auditPath });
+
+    let caught: unknown = null;
+    try {
+      await withBudgetTracker(tracker, () => chat(makeOpts()));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AIConfigError);
+
+    const audit = readAudit();
+    const reserves = audit.filter((e) => e.event === 'reserve' || e.event === 'reserve_unpriced');
+    const records = audit.filter((e) => e.event === 'record' || e.event === 'record_unpriced');
+    // Reserve + record must pair up — even when the provider-resolution step
+    // threw before the per-call try/catch. One reserve, one record.
+    expect(reserves.length).toBe(1);
+    expect(records.length).toBe(1);
+    expect(reserves[0].model).toBe('anthropic:claude-sonnet-4-6');
+    expect(records[0].model).toBe('anthropic:claude-sonnet-4-6');
   });
 });
 

@@ -2265,10 +2265,16 @@ async function _chatOnce(
       return res;
     } catch (err) {
       threw = err;
-      // Test transports re-throw whatever the test specified; we still need
-      // to normalize so the outer fallback loop classifies retry-worthiness
-      // by error class (AITransientError vs AIConfigError).
-      throw threw instanceof AIServiceError ? threw : normalizeAIError(threw, `chat(${modelStr})`);
+      // Test transports re-throw whatever the test specified. Pass-through
+      // for AIServiceError (the gateway's own taxonomy) and SDK/network-
+      // shaped errors normalizeAIError knows how to classify; everything
+      // else (TypeError, RangeError, bun:test assertion failures, raw
+      // strings, etc.) propagates as-is so genuine test bugs surface
+      // instead of being silently converted into a retryable
+      // AITransientError that would fire fallback and mask the failure.
+      throw _isProviderShapedError(err)
+        ? normalizeAIError(err, `chat(${modelStr})`)
+        : err;
     } finally {
       if (tracker) {
         try {
@@ -2301,6 +2307,71 @@ async function _chatOnce(
     }
   }
 
+  // Production path. Wrap resolveChatProvider + the AI SDK call together in
+  // try/finally so a reserved-but-never-recorded reservation can't leak when
+  // resolution itself throws (e.g. AIConfigError for unknown recipe / model
+  // not declared in the recipe). Pre-resolution failures record a
+  // pessimistic-fallback usage under `modelStr` so the tracker sees the
+  // accounting symmetric with reserve(). The post-resolution paths overwrite
+  // _budgetRecorded with the real (or post-error) numbers.
+  let _budgetRecorded = false;
+  const _recordBudget = (modelLabel: string, inputTokens: number, outputTokens: number): void => {
+    if (!tracker || _budgetRecorded) return;
+    _budgetRecorded = true;
+    try {
+      tracker.record({
+        modelId: modelLabel,
+        inputTokens,
+        outputTokens,
+        label: 'gateway.chat',
+      });
+    } catch {
+      // BudgetExhausted (TX1) raised here; surface via next reserve()
+    }
+  };
+
+  try {
+    return await _chatOnceProduction(modelStr, opts, _recordBudget);
+  } finally {
+    // Reserve/record symmetry guarantee: if no record() ran (e.g.
+    // resolveChatProvider threw before the inner try/catch could fire),
+    // charge the pessimistic ceiling so the reservation isn't orphaned.
+    if (!_budgetRecorded && tracker) {
+      const fallback = _extractUsageFromError(null, {
+        inputTokens: estimatedInputTokens,
+        outputTokens: maxOutputTokens,
+      });
+      _recordBudget(modelStr, fallback.inputTokens, fallback.outputTokens);
+    }
+  }
+}
+
+/** Whether `err` looks like a provider/SDK/network error normalizeAIError can
+ * meaningfully classify. Programmer errors (TypeError, RangeError, assertion
+ * failures, raw strings) fall through unchanged so test bugs aren't masked
+ * by silent conversion into a retryable AITransientError. */
+function _isProviderShapedError(err: unknown): boolean {
+  if (err instanceof AIServiceError) return true;
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { name?: unknown; status?: unknown; statusCode?: unknown };
+  // Status-bearing: any HTTP-style error from an SDK or fetch wrapper.
+  if (typeof e.status === 'number' || typeof e.statusCode === 'number') return true;
+  // Vercel AI SDK named errors normalizeAIError knows.
+  if (e.name === 'LoadAPIKeyError' || e.name === 'InvalidArgumentError') return true;
+  // Anything else (TypeError, ReferenceError, plain Error from a test stub
+  // without a status, bun:test assertion errors) is left unchanged.
+  return false;
+}
+
+/** Production-path body of _chatOnce, factored out so the surrounding
+ * try/finally in the caller covers resolveChatProvider too. */
+async function _chatOnceProduction(
+  modelStr: string,
+  opts: ChatOpts,
+  _recordBudget: (modelLabel: string, inputTokens: number, outputTokens: number) => void,
+): Promise<ChatResult> {
+  const estimatedInputTokens = estimateChatInputTokens(opts);
+  const maxOutputTokens = opts.maxTokens ?? 4096;
   const { model, recipe, modelId } = await resolveChatProvider(modelStr);
 
   const supportsCache = recipe.touchpoints.chat?.supports_prompt_cache === true;
@@ -2321,22 +2392,6 @@ async function _chatOnce(
   if (useCache) {
     providerOptions.anthropic = { cacheControl: { type: 'ephemeral' } };
   }
-
-  let _budgetRecorded = false;
-  const _recordBudget = (modelLabel: string, inputTokens: number, outputTokens: number): void => {
-    if (!tracker || _budgetRecorded) return;
-    _budgetRecorded = true;
-    try {
-      tracker.record({
-        modelId: modelLabel,
-        inputTokens,
-        outputTokens,
-        label: 'gateway.chat',
-      });
-    } catch {
-      // BudgetExhausted (TX1) raised here; surface via next reserve()
-    }
-  };
 
   try {
     const result = await generateText({
