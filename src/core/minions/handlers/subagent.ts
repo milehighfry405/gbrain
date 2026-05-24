@@ -437,7 +437,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       // complexity; for v0.15 we lean on the 120s TTL + abort-on-signal.
       try {
         const params: Anthropic.MessageCreateParamsNonStreaming = {
-          model,
+          model: bareAnthropicModelId(model),
           max_tokens: 4096,
           system: [
             { type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } },
@@ -895,6 +895,21 @@ async function runSubagentViaGateway(args: GatewayRunArgs): Promise<SubagentResu
 function recipeIdFromModel(modelString: string): string {
   const idx = modelString.indexOf(':');
   return idx > 0 ? modelString.slice(0, idx) : 'anthropic';
+}
+
+/**
+ * workspace-l5o.11 local workaround. The legacy Anthropic-direct path forwards
+ * `params.model` verbatim to client.messages.create; the gbrain queue validator
+ * (queue.ts:96-115) requires `provider:model` form so config.model arrives
+ * prefixed; Anthropic's API returns 404 on prefixed model strings. Strip
+ * `anthropic:` only at the SDK-call boundary; persisted/logged model strings
+ * keep the prefix for cross-provider tracking.
+ */
+function bareAnthropicModelId(modelString: string): string {
+  const idx = modelString.indexOf(':');
+  if (idx < 0) return modelString;
+  if (modelString.slice(0, idx).trim().toLowerCase() !== 'anthropic') return modelString;
+  return modelString.slice(idx + 1).trim();
 }
 
 /**
