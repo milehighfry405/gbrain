@@ -112,6 +112,7 @@ describe('v0.22.4 migration (B11)', () => {
           },
         ],
         scanned_at: new Date().toISOString(),
+        warnings: [],
         partial: false,
         aborted_at_source: null,
       };

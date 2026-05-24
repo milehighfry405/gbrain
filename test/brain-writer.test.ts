@@ -293,6 +293,178 @@ describe('scanBrainSources (PGLite)', () => {
     expect(report.per_source[0]!.total).toBe(0);
   });
 
+  // workspace-icm4 — pre-fix the gstack source ignored 50/52 (96%) of files
+  // for MISSING_OPEN and still returned ok=true with no other trace. Fix: a
+  // warn-level signal at high ignored ratio that blocks ok=true and surfaces
+  // in report.warnings.
+  describe('workspace-icm4: high ignored MISSING_OPEN ratio surfaces a warning', () => {
+    test('source with 96% missing frontmatter: warning + ok=false', async () => {
+      const src = join(tmp, 'high-ignore');
+      mkdirSync(src, { recursive: true });
+      for (let i = 0; i < 48; i++) {
+        writeFileSync(join(src, `bare${i}.md`), `# Bare title\n\nbody`);
+      }
+      writeFileSync(join(src, 'good1.md'), `${fence}\ntype: x\ntitle: ok\n${fence}\n\nbody`);
+      writeFileSync(join(src, 'good2.md'), `${fence}\ntype: x\ntitle: ok\n${fence}\n\nbody`);
+      await registerSource('high-ignore', src);
+      const report = await scanBrainSources(engine);
+      expect(report.ok).toBe(false);
+      expect(report.total).toBe(0);
+      expect(report.warnings.length).toBe(1);
+      const w = report.warnings[0];
+      expect(w.code).toBe('HIGH_IGNORED_MISSING_OPEN_RATIO');
+      expect(w.source_id).toBe('high-ignore');
+      expect(w.ignored).toBe(48);
+      expect(w.files_scanned).toBe(50);
+      expect(w.ratio).toBeGreaterThan(0.9);
+    });
+
+    test('source with all frontmatter: no warning, ok=true', async () => {
+      const src = join(tmp, 'all-good');
+      mkdirSync(src, { recursive: true });
+      for (let i = 0; i < 10; i++) {
+        writeFileSync(join(src, `p${i}.md`), `${fence}\ntype: x\ntitle: t${i}\n${fence}\n\nbody`);
+      }
+      await registerSource('all-good', src);
+      const report = await scanBrainSources(engine);
+      expect(report.ok).toBe(true);
+      expect(report.warnings).toEqual([]);
+    });
+
+    test('source with low ignored ratio (10%): no warning, ok=true', async () => {
+      const src = join(tmp, 'low-ignore');
+      mkdirSync(src, { recursive: true });
+      for (let i = 0; i < 9; i++) {
+        writeFileSync(join(src, `p${i}.md`), `${fence}\ntype: x\ntitle: t${i}\n${fence}\n\nbody`);
+      }
+      writeFileSync(join(src, 'bare.md'), `# Bare\n\nbody`);
+      await registerSource('low-ignore', src);
+      const report = await scanBrainSources(engine);
+      expect(report.ok).toBe(true);
+      expect(report.warnings).toEqual([]);
+    });
+
+    test('tiny source (2 files all bare): no warning despite 100% ratio (below min-files floor)', async () => {
+      const src = join(tmp, 'tiny');
+      mkdirSync(src, { recursive: true });
+      writeFileSync(join(src, 'a.md'), `# A\n\nbody`);
+      writeFileSync(join(src, 'b.md'), `# B\n\nbody`);
+      await registerSource('tiny', src);
+      const report = await scanBrainSources(engine);
+      // 2 files < min-files floor (4) → ratio not gated even though it's 100%.
+      // Keeps the warning from firing on accidentally-empty trees.
+      expect(report.warnings).toEqual([]);
+      expect(report.ok).toBe(true);
+    });
+
+    test('ratio exactly at threshold (25% of 8 files): warning fires (boundary inclusive)', async () => {
+      const src = join(tmp, 'boundary');
+      mkdirSync(src, { recursive: true });
+      // 2 bare / 6 frontmatter / total 8 → 25% ignored ratio exactly.
+      for (let i = 0; i < 6; i++) {
+        writeFileSync(join(src, `p${i}.md`), `${fence}\ntype: x\ntitle: t${i}\n${fence}\n\nbody`);
+      }
+      writeFileSync(join(src, 'bare1.md'), `# Bare\n\nbody`);
+      writeFileSync(join(src, 'bare2.md'), `# Bare\n\nbody`);
+      await registerSource('boundary', src);
+      const report = await scanBrainSources(engine);
+      expect(report.warnings.length).toBe(1);
+      expect(report.warnings[0].source_id).toBe('boundary');
+      expect(report.warnings[0].ratio).toBeCloseTo(0.25, 5);
+    });
+
+    test('threshold=0 with clean source (ignored=0): no warning (codex P2 #2)', async () => {
+      const src = join(tmp, 'clean-zero-threshold');
+      mkdirSync(src, { recursive: true });
+      for (let i = 0; i < 10; i++) {
+        writeFileSync(join(src, `p${i}.md`), `${fence}\ntype: x\ntitle: t${i}\n${fence}\n\nbody`);
+      }
+      await registerSource('clean-zero-threshold', src);
+      const original = process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN;
+      try {
+        // threshold=0 means "warn on any ignored file" — but a source with
+        // zero ignored files must NOT warn. Pre-P2-fix the comparison
+        // `ratio < threshold` was false for `0 < 0`, so the warning fired.
+        process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN = '0';
+        const report = await scanBrainSources(engine);
+        expect(report.warnings).toEqual([]);
+        expect(report.ok).toBe(true);
+      } finally {
+        if (original === undefined) delete process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN;
+        else process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN = original;
+      }
+    });
+
+    test('multi-source: only the high-ratio source surfaces; the clean source is silent', async () => {
+      const dirty = join(tmp, 'dirty');
+      const clean = join(tmp, 'clean');
+      mkdirSync(dirty, { recursive: true });
+      mkdirSync(clean, { recursive: true });
+      for (let i = 0; i < 8; i++) {
+        writeFileSync(join(dirty, `bare${i}.md`), `# Bare\n\nbody`);
+      }
+      for (let i = 0; i < 8; i++) {
+        writeFileSync(join(clean, `p${i}.md`), `${fence}\ntype: x\ntitle: t${i}\n${fence}\n\nbody`);
+      }
+      await registerSource('dirty', dirty);
+      await registerSource('clean', clean);
+      const report = await scanBrainSources(engine);
+      expect(report.warnings.length).toBe(1);
+      expect(report.warnings[0].source_id).toBe('dirty');
+      // Clean source must not appear anywhere in warnings.
+      expect(report.warnings.find(w => w.source_id === 'clean')).toBeUndefined();
+      expect(report.ok).toBe(false);
+    });
+
+    test('GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN: partially-invalid string falls back to default (codex P2 #3)', async () => {
+      const src = join(tmp, 'parse-strict');
+      mkdirSync(src, { recursive: true });
+      for (let i = 0; i < 10; i++) {
+        writeFileSync(join(src, `bare${i}.md`), `# Bare\n\nbody`);
+      }
+      await registerSource('parse-strict', src);
+      const original = process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN;
+      try {
+        // parseFloat('1.5abc') → 1.5 (silently coerces); Number('1.5abc') → NaN.
+        // Predictable config parsing means we reject this and use the default.
+        process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN = '1.5abc';
+        const report = await scanBrainSources(engine);
+        // Default 0.25 applies → 100% ratio > 0.25 → warning fires.
+        // Pre-P2-fix: parseFloat would accept 1.5, suppress the warning,
+        // and silently mask the high ratio.
+        expect(report.warnings.length).toBe(1);
+      } finally {
+        if (original === undefined) delete process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN;
+        else process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN = original;
+      }
+    });
+
+    test('GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN overrides the default threshold', async () => {
+      const src = join(tmp, 'tunable');
+      mkdirSync(src, { recursive: true });
+      for (let i = 0; i < 10; i++) {
+        writeFileSync(join(src, `bare${i}.md`), `# Bare\n\nbody`);
+      }
+      await registerSource('tunable', src);
+      const original = process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN;
+      try {
+        // Raise threshold above the actual ratio (sentinel >1) → warning suppressed.
+        process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN = '1.5';
+        const acknowledged = await scanBrainSources(engine);
+        expect(acknowledged.warnings).toEqual([]);
+        expect(acknowledged.ok).toBe(true);
+
+        // Invalid env value falls back to default (0.25) → warning fires again.
+        process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN = 'not-a-number';
+        const fallback = await scanBrainSources(engine);
+        expect(fallback.warnings.length).toBe(1);
+      } finally {
+        if (original === undefined) delete process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN;
+        else process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN = original;
+      }
+    });
+  });
+
   test('AbortSignal before scan: every source marked skipped (v0.38.2.0 partial-state contract)', async () => {
     const src = join(tmp, 'big');
     mkdirSync(src, { recursive: true });
