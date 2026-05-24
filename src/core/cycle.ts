@@ -1727,11 +1727,30 @@ export async function runCycle(
   // Best-effort: a write failure does NOT change the CycleReport status.
   // The cost of writing the wrong timestamp post-failure is higher than
   // the cost of missing a successful write (next cycle will redo work).
+  //
+  // v0.39.2.1 (workspace-l5o.30): surface zero-row UPDATEs as warnings.
+  // updateSourceConfig returns false when no row matched the sourceId
+  // (e.g. source archived between fan-out and cycle exit, source row
+  // missing from this engine's `sources` table, or transient pooler
+  // visibility mismatch). Pre-fix the false was silently discarded, so
+  // doctor would keep reporting "Source X has never completed a full
+  // cycle" with no log signal of why. The warn surfaces the symptom so
+  // operators can investigate (autopilot/operator logs are the right
+  // place for this signal — partial cycles still succeed at the job
+  // layer).
   if (opts.sourceId && engine && !dryRun && (status === 'ok' || status === 'clean' || status === 'partial')) {
     try {
-      await engine.updateSourceConfig(opts.sourceId, {
+      const updated = await engine.updateSourceConfig(opts.sourceId, {
         last_full_cycle_at: new Date().toISOString(),
       });
+      if (!updated) {
+        console.warn(
+          `[cycle] last_full_cycle_at write matched 0 rows for source '${opts.sourceId}' — ` +
+          `source row missing from sources table on this engine. ` +
+          `doctor:cycle_freshness will keep reporting this source as stale until resolved. ` +
+          `Check: gbrain sources list | grep '${opts.sourceId}'`
+        );
+      }
     } catch (e) {
       // Best-effort; cycle already succeeded by the time we get here.
       console.warn(`[cycle] failed to write last_full_cycle_at for source ${opts.sourceId}: ${e instanceof Error ? e.message : String(e)}`);

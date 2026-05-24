@@ -60,21 +60,42 @@ describe('runCycle last_full_cycle_at exit hook', () => {
     const before = await readLastFullCycleAt('alpha');
     expect(before).toBeNull();
 
-    // Run a minimal cycle: just lint (filesystem, no DB writes, always returns 'ok')
-    const t0 = Date.now();
-    const report = await runCycle(engine, {
-      brainDir,
-      sourceId: 'alpha',
-      phases: ['lint'],
-    });
-    // lint on an empty dir returns ok+clean+0 fixes
-    expect(['ok', 'clean']).toContain(report.status);
+    // workspace-l5o.30 codex P2-1: capture warns so the negative assertion
+    // below pins "warn only on false return, never on success". Guards
+    // against future refactors / mocks that silently return false from
+    // updateSourceConfig even when the row was written.
+    const warnLines: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = ((...args: unknown[]) => {
+      warnLines.push(args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' '));
+    }) as typeof console.warn;
 
-    const after = await readLastFullCycleAt('alpha');
-    expect(after).not.toBeNull();
-    const writtenMs = new Date(after!).getTime();
-    expect(writtenMs).toBeGreaterThanOrEqual(t0);
-    expect(writtenMs).toBeLessThanOrEqual(Date.now() + 1000);
+    try {
+      // Run a minimal cycle: just lint (filesystem, no DB writes, always returns 'ok')
+      const t0 = Date.now();
+      const report = await runCycle(engine, {
+        brainDir,
+        sourceId: 'alpha',
+        phases: ['lint'],
+      });
+      // lint on an empty dir returns ok+clean+0 fixes
+      expect(['ok', 'clean']).toContain(report.status);
+
+      const after = await readLastFullCycleAt('alpha');
+      expect(after).not.toBeNull();
+      const writtenMs = new Date(after!).getTime();
+      expect(writtenMs).toBeGreaterThanOrEqual(t0);
+      expect(writtenMs).toBeLessThanOrEqual(Date.now() + 1000);
+
+      // workspace-l5o.30 codex P2-1: the successful path MUST NOT emit
+      // the zero-row warn. Symmetric with the
+      // "cycle for an unknown source surfaces a zero-row warning" case
+      // below — together they pin warn-fires-iff-updateSourceConfig-returns-false.
+      const zeroRowWarn = warnLines.find(l => l.includes('matched 0 rows'));
+      expect(zeroRowWarn).toBeUndefined();
+    } finally {
+      console.warn = originalWarn;
+    }
   });
 
   test('legacy caller (no sourceId) does NOT write any source timestamp', async () => {
@@ -134,5 +155,49 @@ describe('runCycle last_full_cycle_at exit hook', () => {
     const second = await readLastFullCycleAt('delta');
     expect(second).not.toBeNull();
     expect(new Date(second!).getTime()).toBeGreaterThan(new Date(first!).getTime());
+  });
+
+  // workspace-l5o.30 — silent zero-row UPDATE on watermark write is the
+  // bug class this guard exists to surface. Pre-fix, cycle.ts:1730
+  // discarded `updateSourceConfig`'s boolean return; if no row matched
+  // the sourceId (e.g. source missing from this engine's sources table
+  // due to subordinate-brain routing, archive race, or pooler visibility
+  // mismatch), the daemon emitted no signal and doctor:cycle_freshness
+  // stayed RED forever.
+  //
+  // Post-fix the call site console.warn's a precise, grep-able line that
+  // names the source AND points operators at the diagnostic command.
+  test('cycle for an unknown source surfaces a zero-row warning instead of silently passing', async () => {
+    // Note: DO NOT seedSource — the point is that the sourceId is not in
+    // the sources table on this engine. Validates the watermark exit hook
+    // does not silently swallow a non-write.
+    const warnLines: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = ((...args: unknown[]) => {
+      warnLines.push(args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' '));
+    }) as typeof console.warn;
+    try {
+      // Use a sourceId that passes assertValidSourceId but isn't in sources.
+      const ghostSourceId = 'ghost-source';
+      const report = await runCycle(engine, {
+        brainDir,
+        sourceId: ghostSourceId,
+        phases: ['lint'],
+      });
+      // Cycle itself still succeeds (watermark write is best-effort).
+      expect(['ok', 'clean']).toContain(report.status);
+      // The watermark warn MUST fire — this is the load-bearing assertion.
+      const watermarkWarn = warnLines.find(l =>
+        l.includes('last_full_cycle_at') &&
+        l.includes('0 rows') &&
+        l.includes(ghostSourceId)
+      );
+      expect(watermarkWarn).toBeDefined();
+      // No row should have appeared with the ghost id.
+      const after = await readLastFullCycleAt(ghostSourceId);
+      expect(after).toBeNull();
+    } finally {
+      console.warn = originalWarn;
+    }
   });
 });
