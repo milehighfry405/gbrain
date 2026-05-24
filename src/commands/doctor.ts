@@ -3390,7 +3390,7 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
       dbPageCountForSource,
     });
 
-    if (report.total === 0 && !report.partial) {
+    if (report.total === 0 && !report.partial && report.warnings.length === 0) {
       const sources = report.per_source.length;
       checks.push({
         name: 'frontmatter_integrity',
@@ -3431,14 +3431,25 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
           .join(', ');
         sourceMessages.push(`${src.source_id}: ${src.total} (${codes})`);
       }
+      // workspace-icm4: bubble high-ignored-ratio warnings into the doctor
+      // message so a 96%-ignored source can no longer pass silently.
+      for (const w of report.warnings) {
+        const pct = Math.round(w.ratio * 100);
+        sourceMessages.push(
+          `${w.source_id}: ${pct}% of files lack frontmatter (${w.ignored}/${w.files_scanned} ignored)`,
+        );
+      }
       const fixHint = report.partial
         ? `Raise GBRAIN_DOCTOR_FM_TIMEOUT_MS or run \`gbrain frontmatter validate <source>\` directly. Fix issues: \`gbrain frontmatter validate <source> --fix\``
         : `Fix: gbrain frontmatter validate <source-path> --fix`;
+      const headline = report.total > 0
+        ? `${report.total} frontmatter issue(s)`
+        : `${report.warnings.length} source(s) with high ignored-frontmatter ratio`;
       checks.push({
         name: 'frontmatter_integrity',
         status: 'warn',
         message:
-          `${report.total} frontmatter issue(s)` +
+          headline +
           (report.partial ? ` (PARTIAL SCAN — timeout after ${fmTimeoutMs / 1000}s)` : '') +
           `. ${sourceMessages.join('; ')}. ${fixHint}`,
       });

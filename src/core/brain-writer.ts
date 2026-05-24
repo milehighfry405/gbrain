@@ -57,6 +57,16 @@ export interface PerSourceReport {
   db_page_count?: number | null;
 }
 
+export interface AuditWarning {
+  /** Stable warning code consumers can switch on. */
+  code: 'HIGH_IGNORED_MISSING_OPEN_RATIO';
+  source_id: string;
+  message: string;
+  ratio: number;
+  ignored: number;
+  files_scanned: number;
+}
+
 export interface AuditReport {
   ok: boolean;
   total: number;
@@ -64,6 +74,12 @@ export interface AuditReport {
   per_source: PerSourceReport[];
   scanned_at: string;
   ignored_missing_open?: number;
+  /** Non-error signals an operator must still see. Currently surfaces sources
+   * where MISSING_OPEN ignores cover a large fraction of the source. Before
+   * workspace-icm4 a 96%-ignored source could pass with ok=true and no other
+   * trace — exactly the silent-warning anti-pattern the brain learning forbids
+   * [default:agent/learnings/2026-05-10-health-green-baseline]. */
+  warnings: AuditWarning[];
   /** True when any source got `status: 'partial'` or `'skipped'`. Doctor uses
    * this to render the warn message and to ensure `ok` is false even when the
    * scanned prefix happened to be clean (codex C2 fix). */
@@ -73,6 +89,30 @@ export interface AuditReport {
 }
 
 const SAMPLE_PER_SOURCE = 20;
+
+/** When a source ignores MISSING_OPEN errors on >= this fraction of its
+ * scanned files, scanBrainSources emits a HIGH_IGNORED_MISSING_OPEN_RATIO
+ * warning and the report is no longer `ok`. Set by feel from the
+ * workspace-icm4 evidence: default source = 0.0, gstack = 0.96 — a 25% gate
+ * separates "a few stray docs" from "this source has effectively no
+ * frontmatter coverage and the operator should know". Overridable via
+ * GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN. */
+export const DEFAULT_IGNORED_MISSING_OPEN_RATIO_WARN = 0.25;
+
+/** Below this scan count the ratio is too noisy to gate on — a 1/2 source
+ * would always trip. Sources with fewer scanned files just suppress the
+ * warning. */
+const IGNORED_RATIO_MIN_FILES = 4;
+
+function readIgnoredRatioThreshold(): number {
+  const raw = process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN;
+  if (!raw) return DEFAULT_IGNORED_MISSING_OPEN_RATIO_WARN;
+  const n = parseFloat(raw);
+  // Allow values >1 as a "never warn" sentinel — useful for sources the
+  // operator has explicitly acknowledged as non-wiki (e.g. repo mirrors).
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_IGNORED_MISSING_OPEN_RATIO_WARN;
+  return n;
+}
 
 // ---------------------------------------------------------------------------
 // Frontmatter backups
@@ -524,16 +564,39 @@ export async function scanBrainSources(
 
   const hasPartialOrSkipped = perSource.some(r => r.status === 'partial' || r.status === 'skipped');
 
+  const ignoredRatioThreshold = readIgnoredRatioThreshold();
+  const warnings: AuditWarning[] = [];
+  for (const src of perSource) {
+    if (src.status !== 'scanned') continue;
+    if (src.files_scanned < IGNORED_RATIO_MIN_FILES) continue;
+    const ratio = src.ignoredMissingOpen / src.files_scanned;
+    if (ratio < ignoredRatioThreshold) continue;
+    const pct = Math.round(ratio * 100);
+    warnings.push({
+      code: 'HIGH_IGNORED_MISSING_OPEN_RATIO',
+      source_id: src.source_id,
+      message:
+        `${src.ignoredMissingOpen} of ${src.files_scanned} files (${pct}%) lack frontmatter and were ignored. ` +
+        `Either treat this source as wiki-canonical (re-run with strictMissingOpen) ` +
+        `or acknowledge the ignore (raise GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN above ${ratio.toFixed(2)}).`,
+      ratio,
+      ignored: src.ignoredMissingOpen,
+      files_scanned: src.files_scanned,
+    });
+  }
+
   return {
     // Partial scans can never be 'ok' even when the scanned prefix is clean
     // (codex outside-voice C2 — a clean prefix doesn't speak for the
-    // unscanned suffix).
-    ok: grandTotal === 0 && !hasPartialOrSkipped,
+    // unscanned suffix). Likewise, warnings (workspace-icm4) block ok=true so
+    // a 96%-ignored source can't pass silently.
+    ok: grandTotal === 0 && !hasPartialOrSkipped && warnings.length === 0,
     total: grandTotal,
     errors_by_code: totals,
     per_source: perSource,
     scanned_at: new Date().toISOString(),
     ignored_missing_open: ignoredMissingOpen || undefined,
+    warnings,
     partial: hasPartialOrSkipped,
     aborted_at_source: abortedAtSource,
   };

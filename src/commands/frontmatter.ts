@@ -341,6 +341,9 @@ function printAuditHumanReport(report: AuditReport): void {
   if (report.ignored_missing_open) {
     console.log(`Missing frontmatter ignored: ${report.ignored_missing_open} file(s). Use \`frontmatter validate\` for strict per-file checks or \`frontmatter generate\` to add meaningful metadata.`);
   }
+  for (const w of report.warnings) {
+    console.log(`WARN [${w.code}] ${w.source_id}: ${w.message}`);
+  }
   for (const src of report.per_source) {
     console.log(`\n[${src.source_id}] ${src.source_path}`);
     if (src.total === 0) {
