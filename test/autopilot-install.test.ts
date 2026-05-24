@@ -20,7 +20,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 
-import { detectInstallTarget } from '../src/commands/autopilot.ts';
+import { detectInstallTarget, generateWrapperScriptContent } from '../src/commands/autopilot.ts';
 
 let tmp: string;
 const envSnapshot: Record<string, string | undefined> = {};
@@ -97,5 +97,93 @@ describe('autopilot wrapper script — env source order (v0.36.1.x #966)', () =>
     // Both should appear inside writeWrapperScript's heredoc as `source ~/.foo`
     expect(src).toMatch(/source\s+~\/\.zshenv/);
     expect(src).toMatch(/source\s+~\/\.zshrc/);
+  });
+});
+
+// workspace-l5o.34: --env-file lets the install wrapper source a host/app env
+// file (e.g. /data/.openclaw/.env on AlphaClaw) so API keys reach autopilot
+// even when not exported via ~/.zshenv. The autopilot daemon's subagent
+// dispatch path constructs `new Anthropic()` (no explicit key arg), which
+// resolves ANTHROPIC_API_KEY from process.env at construction — when the env
+// is empty (the AlphaClaw default before this fix), every subagent job
+// permanently failed with "Could not resolve authentication method."
+describe('generateWrapperScriptContent — --env-file (workspace-l5o.34)', () => {
+  test('omits env-file block when no path provided (backward compat)', () => {
+    const content = generateWrapperScriptContent('/usr/bin/gbrain', '/data/brain');
+    expect(content).not.toMatch(/--env-file/);
+    expect(content).not.toMatch(/set -a/);
+    // Pre-existing zshenv → zshrc chain still present.
+    expect(content).toMatch(/source\s+~\/\.zshenv/);
+    expect(content).toMatch(/source\s+~\/\.zshrc/);
+  });
+
+  test('sources env-file BEFORE ~/.zshenv when provided', () => {
+    const content = generateWrapperScriptContent(
+      '/usr/bin/gbrain',
+      '/data/brain',
+      '/data/.openclaw/.env',
+    );
+    const envFileIdx = content.indexOf('/data/.openclaw/.env');
+    const zshenvIdx = content.indexOf('~/.zshenv');
+    expect(envFileIdx).toBeGreaterThan(-1);
+    expect(zshenvIdx).toBeGreaterThan(-1);
+    expect(envFileIdx).toBeLessThan(zshenvIdx);
+  });
+
+  test('wraps env-file source in set -a / set +a so child processes inherit', () => {
+    const content = generateWrapperScriptContent(
+      '/usr/bin/gbrain',
+      '/data/brain',
+      '/data/.openclaw/.env',
+    );
+    // The codex-P2#1 fix: must be an if/fi block, NOT an && chain. The && chain
+    // skipped `set +a` whenever `source` returned nonzero (e.g. malformed env
+    // file), leaving allexport on while ~/.zshenv et al. were sourced after.
+    expect(content).toMatch(/if \[ -f '\/data\/\.openclaw\/\.env' \]; then\s+set -a\s+source '\/data\/\.openclaw\/\.env' 2>\/dev\/null \|\| true\s+set \+a\s+fi/);
+  });
+
+  test('set +a runs even when source fails (codex-P2#1 fix — no && chain)', () => {
+    const content = generateWrapperScriptContent(
+      '/usr/bin/gbrain',
+      '/data/brain',
+      '/data/.openclaw/.env',
+    );
+    // Negative assertion: the bug-shape that skipped set +a on failure.
+    expect(content).not.toMatch(/&& set \+a/);
+    // Positive assertion: source uses || true so the script doesn't error out,
+    // and set +a is on its own line within the if/fi block.
+    expect(content).toMatch(/source '[^']+' 2>\/dev\/null \|\| true/);
+  });
+
+  test("escapes single quotes in env-file path to prevent shell injection", () => {
+    const content = generateWrapperScriptContent(
+      '/usr/bin/gbrain',
+      '/data/brain',
+      "/path/with'quote.env",
+    );
+    // Single-quote escaping convention: ' becomes '\''
+    expect(content).toContain("/path/with'\\''quote.env");
+  });
+
+  test('preserves zshenv-before-zshrc invariant when env-file is set', () => {
+    const content = generateWrapperScriptContent(
+      '/usr/bin/gbrain',
+      '/data/brain',
+      '/data/.openclaw/.env',
+    );
+    const zshenvIdx = content.indexOf('~/.zshenv');
+    const zshrcIdx = content.indexOf('~/.zshrc');
+    expect(zshenvIdx).toBeGreaterThan(-1);
+    expect(zshrcIdx).toBeGreaterThan(-1);
+    expect(zshenvIdx).toBeLessThan(zshrcIdx);
+  });
+
+  test('still exec-s gbrain with the supplied repo path (env-file is additive)', () => {
+    const content = generateWrapperScriptContent(
+      '/custom/bin/gbrain',
+      '/some/repo',
+      '/data/.openclaw/.env',
+    );
+    expect(content).toMatch(/exec '\/custom\/bin\/gbrain' autopilot --repo '\/some\/repo'/);
   });
 });
