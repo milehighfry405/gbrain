@@ -57,11 +57,13 @@ async function withoutAnthropicKey<T>(body: () => Promise<T>): Promise<T> {
 /**
  * Insert N reflection pages directly via engine.putPage so the patterns
  * gather query has data without going through the synthesize phase.
- * Slugs follow the v0.23 wiki/personal/reflections/<topic>-<hash> shape.
+ * Slugs follow the personal/reflections/<topic>-<hash> shape (the
+ * dream-cycle allow-list canonical prefix; workspace-l5o.33 reconciled
+ * the historical wiki/ prefix away).
  */
 async function seedReflections(engine: PGLiteEngine, count: number): Promise<void> {
   for (let i = 0; i < count; i++) {
-    const slug = `wiki/personal/reflections/2026-04-${String(15 + i).padStart(2, '0')}-test-pattern-aaa${i}`;
+    const slug = `personal/reflections/2026-04-${String(15 + i).padStart(2, '0')}-test-pattern-aaa${i}`;
     await engine.putPage(slug, {
       type: 'note',
       title: `Reflection ${i}`,

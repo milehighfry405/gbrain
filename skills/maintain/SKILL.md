@@ -126,8 +126,8 @@ The two new phases consolidate yesterday's conversations into long-term memory:
 **Synthesize phase:** reads transcripts from `dream.synthesize.session_corpus_dir`,
 runs a cheap Haiku verdict (cached in `dream_verdicts`) to filter routine
 ops sessions, then fans out one Sonnet subagent per worth-processing
-transcript. Each subagent writes reflections (`wiki/personal/reflections/...`),
-originals (`wiki/originals/ideas/...`), and people timeline entries. The
+transcript. Each subagent writes reflections (`personal/reflections/...`),
+originals (`originals/ideas/...`), and people timeline entries. The
 orchestrator collects the slugs from `subagent_tool_executions` (NOT
 `pages.updated_at` — that would pick up unrelated writes) and reverse-renders
 each new page from DB → markdown on disk.
@@ -135,7 +135,7 @@ each new page from DB → markdown on disk.
 **Patterns phase:** runs after `extract` (so the graph state is fresh).
 Reads recent reflections within `dream.patterns.lookback_days` (default 30),
 runs a single Sonnet pass to surface recurring themes, and writes pattern
-pages to `wiki/personal/patterns/<theme>` when ≥`dream.patterns.min_evidence`
+pages to `personal/patterns/<theme>` when ≥`dream.patterns.min_evidence`
 (default 3) reflections support a pattern.
 
 **Quality bar (Iron Law for synthesis):**

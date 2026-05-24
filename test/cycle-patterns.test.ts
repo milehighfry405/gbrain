@@ -69,8 +69,14 @@ describe('patterns phase wiring', () => {
 });
 
 describe('patterns scope filter', () => {
-  test('filters reflections by slug LIKE wiki/personal/reflections/%', () => {
-    expect(patternsSrc).toContain("slug LIKE 'wiki/personal/reflections/%'");
+  test('filters reflections by slug LIKE personal/reflections/% (no wiki/ prefix)', () => {
+    // workspace-l5o.33: the patterns query MUST match the slug prefix
+    // where synth actually writes — `personal/reflections/*` per
+    // _brain-filing-rules.json dream_synthesize_paths.globs. The historical
+    // `wiki/personal/reflections/` prefix was a stale half-migration that
+    // silently broke patterns (insufficient_evidence on every cycle).
+    expect(patternsSrc).toContain("slug LIKE 'personal/reflections/%'");
+    expect(patternsSrc).not.toContain("'wiki/personal/reflections/%'");
   });
 
   test('orders by updated_at DESC for recency-bias', () => {
@@ -79,5 +85,58 @@ describe('patterns scope filter', () => {
 
   test('caps gather to 100 reflections (cost control)', () => {
     expect(patternsSrc).toContain('LIMIT 100');
+  });
+});
+
+describe('patterns/synthesize slug-prefix contract (workspace-l5o.33)', () => {
+  const synthSrc = readFileSync(
+    new URL('../src/core/cycle/synthesize.ts', import.meta.url),
+    'utf-8',
+  );
+  const filingRulesJson = JSON.parse(readFileSync(
+    new URL('../skills/_brain-filing-rules.json', import.meta.url),
+    'utf-8',
+  )) as { dream_synthesize_paths?: { globs?: string[] } };
+  const allowlistGlobs = filingRulesJson.dream_synthesize_paths?.globs ?? [];
+
+  test('allowlist contains personal/reflections/* (where synth writes)', () => {
+    expect(allowlistGlobs).toContain('personal/reflections/*');
+  });
+
+  test('allowlist contains personal/patterns/* (where patterns writes)', () => {
+    expect(allowlistGlobs).toContain('personal/patterns/*');
+  });
+
+  test('allowlist has no stale wiki/ globs', () => {
+    for (const g of allowlistGlobs) {
+      expect(g).not.toMatch(/^wiki\//);
+    }
+  });
+
+  test('synthesize prompt instructs reflection slug = personal/reflections/...', () => {
+    expect(synthSrc).toContain('personal/reflections/${dateHint}-<topic-slug>-${hashSuffix}');
+    expect(synthSrc).not.toContain('wiki/personal/reflections/${dateHint}');
+  });
+
+  test('synthesize prompt instructs original slug = originals/ideas/...', () => {
+    expect(synthSrc).toContain('originals/ideas/${dateHint}-<idea-slug>-${hashSuffix}');
+    expect(synthSrc).not.toContain('wiki/originals/ideas/${dateHint}');
+  });
+
+  test('patterns prompt instructs pattern slug = personal/patterns/<topic>', () => {
+    expect(patternsSrc).toContain('personal/patterns/<topic-slug>');
+    expect(patternsSrc).not.toContain('wiki/personal/patterns/<topic-slug>');
+  });
+
+  test('patterns query prefix is covered by the synthesize allowlist (closed loop)', () => {
+    // The patterns phase queries reflections written by synthesize. The
+    // query prefix MUST be one that the allowlist permits, otherwise the
+    // patterns phase silently degrades to skipped('insufficient_evidence').
+    const queryPrefix = 'personal/reflections/';
+    const covered = allowlistGlobs.some(g => {
+      if (g.endsWith('/*')) return queryPrefix.startsWith(g.slice(0, -2) + '/');
+      return queryPrefix.startsWith(g);
+    });
+    expect(covered).toBe(true);
   });
 });
