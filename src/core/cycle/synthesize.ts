@@ -679,8 +679,14 @@ NOT WORTH PROCESSING (return worth_processing=false):
 Respond as JSON: {"worth_processing": <bool>, "reasons": ["<short>", "<short>"]}.
 Two reasons max, one phrase each.`;
 
+  // workspace-l5o.11 local workaround — same prefix-strip as subagent.ts:440.
+  // Anthropic SDK doesn't strip `anthropic:` prefix; API returns 404 on prefixed
+  // model strings. resolveModel preserves whatever's in config so we strip here.
+  const bareVerdictModel = verdictModel.toLowerCase().startsWith('anthropic:')
+    ? verdictModel.slice('anthropic:'.length).trim()
+    : verdictModel;
   const msg = await client.create({
-    model: verdictModel,
+    model: bareVerdictModel,
     max_tokens: 200,
     system: sys,
     messages: [{ role: 'user', content: `Transcript ${t.basename}:\n\n${trimmed}` }],
@@ -795,10 +801,10 @@ OUTPUT POLICY (ALL of these are required)
 
 TASKS
 A. Reflections (self-knowledge, pattern recognition, emotional processing):
-   slug: \`wiki/personal/reflections/${dateHint}-<topic-slug>-${hashSuffix}\`
+   slug: \`personal/reflections/${dateHint}-<topic-slug>-${hashSuffix}\`
 
 B. Originals (new ideas, frames, theses, mental models):
-   slug: \`wiki/originals/ideas/${dateHint}-<idea-slug>-${hashSuffix}\`
+   slug: \`originals/${dateHint}-<idea-slug>-${hashSuffix}\`
 
 C. People mentions: search first; if a page exists, do not put_page over it (the orchestrator handles people enrichment via timeline entries — your job is the reflection/original synthesis, NOT modifying existing person pages).
 

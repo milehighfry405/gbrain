@@ -174,7 +174,7 @@ async function gatherReflections(
   const rows = await engine.executeRaw<{ slug: string; title: string | null; compiled_truth: string | null }>(
     `SELECT slug, title, compiled_truth
        FROM pages
-      WHERE slug LIKE 'wiki/personal/reflections/%'
+      WHERE (slug LIKE 'personal/reflections/%' OR slug LIKE 'wiki/personal/reflections/%')
         AND updated_at >= $1::timestamptz
       ORDER BY updated_at DESC
       LIMIT 100`,
