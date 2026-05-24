@@ -127,7 +127,7 @@ The two new phases consolidate yesterday's conversations into long-term memory:
 runs a cheap Haiku verdict (cached in `dream_verdicts`) to filter routine
 ops sessions, then fans out one Sonnet subagent per worth-processing
 transcript. Each subagent writes reflections (`personal/reflections/...`),
-originals (`originals/ideas/...`), and people timeline entries. The
+originals (`originals/...`), and people timeline entries. The
 orchestrator collects the slugs from `subagent_tool_executions` (NOT
 `pages.updated_at` — that would pick up unrelated writes) and reverse-renders
 each new page from DB → markdown on disk.

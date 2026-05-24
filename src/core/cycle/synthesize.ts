@@ -798,7 +798,7 @@ A. Reflections (self-knowledge, pattern recognition, emotional processing):
    slug: \`personal/reflections/${dateHint}-<topic-slug>-${hashSuffix}\`
 
 B. Originals (new ideas, frames, theses, mental models):
-   slug: \`originals/ideas/${dateHint}-<idea-slug>-${hashSuffix}\`
+   slug: \`originals/${dateHint}-<idea-slug>-${hashSuffix}\`
 
 C. People mentions: search first; if a page exists, do not put_page over it (the orchestrator handles people enrichment via timeline entries — your job is the reflection/original synthesis, NOT modifying existing person pages).
 

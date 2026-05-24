@@ -118,9 +118,35 @@ describe('patterns/synthesize slug-prefix contract (workspace-l5o.33)', () => {
     expect(synthSrc).not.toContain('wiki/personal/reflections/${dateHint}');
   });
 
-  test('synthesize prompt instructs original slug = originals/ideas/...', () => {
-    expect(synthSrc).toContain('originals/ideas/${dateHint}-<idea-slug>-${hashSuffix}');
-    expect(synthSrc).not.toContain('wiki/originals/ideas/${dateHint}');
+  test('synthesize prompt instructs original slug = originals/<flat>... (per RESOLVER.md)', () => {
+    // RESOLVER.md disambiguation rules: `originals/` = your thinking (frameworks,
+    // takes, predictions) at TOP LEVEL flat. `ideas/` = things to build, SEPARATE
+    // top-level dir. Synth writes "your original thinking" → MUST land in `originals/`
+    // flat, NEVER nested under `originals/ideas/`. Disk reality: 32 originals at
+    // /data/brain/originals/*.md (flat); the 1 page that briefly drifted in the
+    // 2026-05-24 quiet-magnolia session ended up at originals/ideas/ (since moved).
+    expect(synthSrc).toContain('originals/${dateHint}-<idea-slug>-${hashSuffix}');
+    // Regression guard — both stale variants forbidden.
+    expect(synthSrc).not.toContain('wiki/originals/');
+    expect(synthSrc).not.toContain('originals/ideas/${dateHint}');
+  });
+
+  test('filing-rules doc instructs original slug = originals/<flat>... (no ideas/ nest)', () => {
+    const filingRulesMd = readFileSync(
+      new URL('../skills/_brain-filing-rules.md', import.meta.url),
+      'utf-8',
+    );
+    // Catches drift between code prompt + human-facing doc.
+    expect(filingRulesMd).toMatch(/originals\/YYYY-MM-DD-<idea>/);
+    expect(filingRulesMd).not.toMatch(/originals\/ideas\/YYYY-MM-DD-<idea>/);
+  });
+
+  test('maintain skill doc references originals/ flat (no ideas/ nest)', () => {
+    const maintainSkill = readFileSync(
+      new URL('../skills/maintain/SKILL.md', import.meta.url),
+      'utf-8',
+    );
+    expect(maintainSkill).not.toMatch(/originals\/ideas\//);
   });
 
   test('patterns prompt instructs pattern slug = personal/patterns/<topic>', () => {
