@@ -527,33 +527,16 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
       // orphan sweep run too (previously this path only did sync +
       // extract + embed, which didn't match the Minions-dispatch
       // path's phase set). Now both converge on the same primitive.
+      //
+      // v0.38 workspace-4x5: fan out per-source so each runCycle call
+      // passes `sourceId`, which gates the `last_full_cycle_at`
+      // watermark write at cycle.ts:1730. Without this, the inline
+      // fallback (the PGLite/cockpit path) silently never wrote the
+      // freshness watermark and `doctor:cycle_freshness` FAILed.
+      // Symmetric with the Minions `dispatchPerSource` path above.
       try {
-        const { runCycle } = await import('../core/cycle.ts');
-        const report = await runCycle(engine, {
-          brainDir: repoPath,
-          // Autopilot daemon path: pulls by default (matches
-          // pre-v0.17 autopilot behavior). CLI dream defaults false
-          // for cron safety; that choice is scoped to dream only.
-          pull: true,
-          yieldBetweenPhases: async () => {
-            await new Promise(r => setImmediate(r));
-          },
-        });
-        // Only 'failed' (every attempted phase failed) trips the autopilot
-        // circuit breaker. 'partial' means at least one phase warned or
-        // failed while others ran — that's a soft signal, not a fatal
-        // condition. Treating 'partial' as failure here caused respawn
-        // storms under KeepAlive=true on brains where a single phase
-        // (typically `orphans`) emits a 'warn' every cycle in steady state.
-        if (report.status === 'failed') {
-          cycleOk = false;
-        }
-        if (jsonMode) {
-          process.stderr.write(JSON.stringify({ event: 'cycle-inline', status: report.status, duration_ms: report.duration_ms, totals: report.totals }) + '\n');
-        } else {
-          const t = report.totals;
-          console.log(`[cycle-inline ${report.status}] lint=${t.lint_fixes} backlinks=${t.backlinks_added} synced=${t.pages_synced} extracted=${t.pages_extracted} embedded=${t.pages_embedded} orphans=${t.orphans_found}`);
-        }
+        const inlineOk = await runInlineCycleTick(engine, { repoPath, jsonMode });
+        if (!inlineOk) cycleOk = false;
       } catch (e) { logError('cycle-inline', e); cycleOk = false; }
     }
 
@@ -588,6 +571,122 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
 
     // Wait for next cycle
     await new Promise(r => setTimeout(r, interval * 1000));
+  }
+}
+
+// --- Inline-fallback per-source dispatch (v0.38 workspace-4x5) ---
+
+/**
+ * Inline-fallback per-source cycle dispatcher. Mirrors `dispatchPerSource`
+ * semantics (oldest-first, fanoutMax cap, per-source `pull` from
+ * `remote_url`) but runs cycles **synchronously in-process** — no job
+ * queue indirection — because the inline path is only taken when the
+ * Minions queue is disabled (PGLite, --inline, or no `minion_mode`).
+ *
+ * The headline win: each `runCycle` call passes `sourceId`, which is the
+ * gate for the `sources.config.last_full_cycle_at` watermark write at
+ * `cycle.ts:1730`. Without this, the inline path never wrote the
+ * watermark and `doctor:cycle_freshness` reported FAIL.
+ *
+ * Returns `true` when the tick should be considered healthy. Only
+ * `report.status === 'failed'` trips it (mirrors prior contract:
+ * `'partial'` is a soft signal, never fatal).
+ *
+ * Extracted so the test suite can exercise the inline path against a
+ * PGLite fixture without spawning a daemon. See
+ * `test/autopilot-inline-fanout.test.ts`.
+ */
+export async function runInlineCycleTick(
+  engine: BrainEngine,
+  opts: { repoPath: string; jsonMode: boolean },
+): Promise<boolean> {
+  const { runCycle } = await import('../core/cycle.ts');
+  const { selectSourcesForDispatch, resolveFanoutMax } = await import('./autopilot-fanout.ts');
+  const { repoPath, jsonMode } = opts;
+
+  // Enumerate sources. Pre-v0.18 brains without the sources table throw
+  // here; that's the signal to fall through to the legacy single-source
+  // call (no sourceId) — preserves existing behavior.
+  let sources: Awaited<ReturnType<BrainEngine['listAllSources']>> = [];
+  let listAllSourcesFailed = false;
+  try {
+    sources = await engine.listAllSources({ localPathOnly: true });
+  } catch {
+    listAllSourcesFailed = true;
+  }
+
+  const yieldBetweenPhases = async () => { await new Promise(r => setImmediate(r)); };
+
+  // Legacy single-source brain (or pre-v0.18 schema): preserve the
+  // pre-fix behavior — one runCycle, no sourceId, pull:true (matches
+  // pre-v0.17 autopilot daemon default).
+  if (listAllSourcesFailed || sources.length === 0) {
+    const report = await runCycle(engine, {
+      brainDir: repoPath,
+      pull: true,
+      yieldBetweenPhases,
+    });
+    logInlineCycle(jsonMode, null, report);
+    return report.status !== 'failed';
+  }
+
+  // Per-source fan-out — symmetric with Minions `dispatchPerSource`.
+  const fanoutMax = await resolveFanoutMax(engine);
+  const { dispatch, skippedFresh, skippedCap } = selectSourcesForDispatch(sources, fanoutMax);
+
+  let ok = true;
+  for (const src of dispatch) {
+    const remoteUrl = typeof src.config?.remote_url === 'string' ? src.config.remote_url : null;
+    try {
+      const report = await runCycle(engine, {
+        brainDir: repoPath,
+        sourceId: src.id,            // THE FIX (workspace-4x5)
+        pull: !!remoteUrl,           // mirrors dispatchPerSource:204-210
+        yieldBetweenPhases,
+      });
+      if (report.status === 'failed') ok = false;
+      logInlineCycle(jsonMode, src.id, report);
+    } catch (e) {
+      // Per-source failure does not abort the tick — sibling sources
+      // still try (defensive, matches dispatchPerSource E1 F1).
+      logError(`cycle-inline source=${src.id}`, e);
+      ok = false;
+    }
+  }
+
+  // One-line summary mirroring the Minions `fanout_summary` event.
+  if (jsonMode) {
+    process.stderr.write(JSON.stringify({
+      event: 'cycle-inline-summary',
+      dispatched: dispatch.length,
+      skipped_fresh: skippedFresh.length,
+      skipped_cap: skippedCap.length,
+      fanout_max: fanoutMax,
+    }) + '\n');
+  } else {
+    console.log(`[cycle-inline] dispatched=${dispatch.length} skipped_fresh=${skippedFresh.length} skipped_cap=${skippedCap.length}`);
+  }
+
+  return ok;
+}
+
+function logInlineCycle(
+  jsonMode: boolean,
+  sourceId: string | null,
+  report: { status: string; duration_ms: number; totals: Record<string, number> },
+): void {
+  if (jsonMode) {
+    process.stderr.write(JSON.stringify({
+      event: 'cycle-inline',
+      ...(sourceId !== null ? { source_id: sourceId } : {}),
+      status: report.status,
+      duration_ms: report.duration_ms,
+      totals: report.totals,
+    }) + '\n');
+  } else {
+    const t = report.totals;
+    const srcTag = sourceId !== null ? ` source=${sourceId}` : '';
+    console.log(`[cycle-inline ${report.status}${srcTag}] lint=${t.lint_fixes} backlinks=${t.backlinks_added} synced=${t.pages_synced} extracted=${t.pages_extracted} embedded=${t.pages_embedded} orphans=${t.orphans_found}`);
   }
 }
 
@@ -1012,9 +1111,19 @@ function showStatus(json: boolean) {
     lastLine = lines[lines.length - 1] || '';
   } catch { /* no log */ }
 
+  // v0.38 workspace-4x5: detect ALL install targets `installDaemon` writes,
+  // not just launchd + crontab. Ephemeral containers (Docker / Render /
+  // Railway / Fly) install `~/.gbrain/start-autopilot.sh` and have no
+  // crontab — the prior code reported `installed:false` even with a
+  // healthy supervisor. Order mirrors `detectInstallTarget()` so the
+  // status check and install path agree on what counts as installed.
   let installed = false;
   if (process.platform === 'darwin') {
     installed = existsSync(plistPath());
+  } else if (existsSync('/.dockerenv') || existsSync(ephemeralStartScriptPath())) {
+    installed = existsSync(ephemeralStartScriptPath());
+  } else if (existsSync(systemdUnitPath())) {
+    installed = true;
   } else {
     try {
       const crontab = execSync('crontab -l 2>/dev/null || true', { encoding: 'utf-8' });
