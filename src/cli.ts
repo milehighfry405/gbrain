@@ -1714,7 +1714,8 @@ CODE INDEXING (v0.19.0 / v0.20.0 Cathedral II)
   sync --strategy code               Sync code files into the brain
 
 JOBS (Minions)
-  jobs submit <name> [--params JSON]  Submit background job [--follow] [--dry-run]
+  jobs submit <name> [JSON|--data|--params]  Submit job; data accepts positional
+                                              JSON or --data/--params flag [--follow]
   jobs list [--status S] [--limit N]  List jobs
   jobs get <id>                       Job details + history
   jobs cancel <id>                    Cancel job

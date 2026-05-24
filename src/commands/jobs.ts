@@ -60,6 +60,84 @@ export function parseMaxRssFlag(args: string[]): number | undefined {
   return parsed;
 }
 
+/**
+ * Parse the data payload for `gbrain jobs submit`.
+ *
+ * Accepts three input forms, in priority order:
+ *   1. `--params <JSON>`  (canonical, original form)
+ *   2. `--data <JSON>`    (alias — added v0.40.2.1 for parity with worker
+ *                          docs and direct queue.add({data}) semantics)
+ *   3. Positional JSON at args[2]: `gbrain jobs submit <name> '<JSON>'`
+ *      (only recognised when the token starts with `{` or `[`, so option
+ *      values for later flags aren't mistaken for the data payload)
+ *
+ * Returns `{}` when no form is present.
+ *
+ * Throws `Error` on:
+ *   - More than one form supplied simultaneously (ambiguous; bail)
+ *   - JSON parse failure
+ *   - JSON that parses to a non-object (queue.add expects Record<string,unknown>)
+ *
+ * Bug fix (workspace-l5o.21): prior to this helper, only `--params` was
+ * recognised. `--data` and positional JSON were silently dropped, producing
+ * a `Data: {}` row in `minion_jobs` with no operator-visible error. Manual
+ * job triggers (e.g. autopilot-cycle with a controlled source_id) ran with
+ * undefined payload and skipped key behaviour (watermark write at
+ * cycle.ts:~1730).
+ *
+ * Exported for unit tests. The CLI handler at `jobs submit` wraps this
+ * with `process.exit(1)` on throw.
+ */
+export function parseSubmitDataFlag(args: string[]): Record<string, unknown> {
+  // Form 1 + 2: flag values
+  const paramsStr = parseFlag(args, '--params');
+  const dataStr = parseFlag(args, '--data');
+
+  // Form 3: positional JSON. `args` here is the runJobs args (sub at [0],
+  // name at [1]). The first candidate is args[2]. A positional value is
+  // ONLY recognised when it starts with `{` or `[` so we don't swallow
+  // a later flag's option value or a stray identifier.
+  let positionalStr: string | undefined;
+  const positionalCandidate = args[2];
+  if (
+    positionalCandidate !== undefined &&
+    !positionalCandidate.startsWith('-') &&
+    (positionalCandidate.startsWith('{') || positionalCandidate.startsWith('['))
+  ) {
+    positionalStr = positionalCandidate;
+  }
+
+  const supplied = [
+    paramsStr !== undefined ? '--params' : null,
+    dataStr !== undefined ? '--data' : null,
+    positionalStr !== undefined ? '<positional JSON>' : null,
+  ].filter((v): v is string => v !== null);
+
+  if (supplied.length === 0) return {};
+  if (supplied.length > 1) {
+    throw new Error(
+      `multiple data sources supplied (${supplied.join(', ')}); pick exactly one`
+    );
+  }
+
+  const raw = paramsStr ?? dataStr ?? positionalStr!;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`data payload must be valid JSON (${msg})`);
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(
+      'data payload must be a JSON object (got ' +
+        (parsed === null ? 'null' : Array.isArray(parsed) ? 'array' : typeof parsed) +
+        ')'
+    );
+  }
+  return parsed as Record<string, unknown>;
+}
+
 export function resolveWorkerConcurrency(args: string[], env: NodeJS.ProcessEnv = process.env): number {
   const raw = parseFlag(args, '--concurrency') ?? env.GBRAIN_WORKER_CONCURRENCY ?? '1';
   const parsed = parseInt(raw, 10);
@@ -120,7 +198,8 @@ export async function runJobs(engine: BrainEngine, args: string[]): Promise<void
     console.log(`gbrain jobs — Minions job queue
 
 USAGE
-  gbrain jobs submit <name> [--params JSON] [--follow] [--priority N]
+  gbrain jobs submit <name> [<JSON> | --params JSON | --data JSON]
+                            [--follow] [--priority N]
                             [--delay Nms] [--max-attempts N] [--max-stalled N]
                             [--max-waiting N]
                             [--backoff-type fixed|exponential] [--backoff-delay Nms]
@@ -201,11 +280,17 @@ HANDLER TYPES (built in)
         process.exit(1);
       }
 
-      const paramsStr = parseFlag(args, '--params');
-      let data: Record<string, unknown> = {};
-      if (paramsStr) {
-        try { data = JSON.parse(paramsStr); }
-        catch { console.error('Error: --params must be valid JSON'); process.exit(1); }
+      // v0.40.2.1 (workspace-l5o.21): parse data payload from any of
+      //   --params <JSON>  (canonical)
+      //   --data <JSON>    (alias — matches worker docs + queue.add({data}))
+      //   positional JSON  (e.g. `gbrain jobs submit foo '{"x":1}'`)
+      // parseSubmitDataFlag throws on ambiguity / invalid JSON / non-object.
+      let data: Record<string, unknown>;
+      try {
+        data = parseSubmitDataFlag(args);
+      } catch (e) {
+        console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
+        process.exit(1);
       }
 
       const priority = parseInt(parseFlag(args, '--priority') ?? '0', 10);
