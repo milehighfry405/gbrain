@@ -423,9 +423,70 @@ function shouldSkipProvider(modelStr: string, skip: string[]): boolean {
   return skip.includes(provider);
 }
 
+/**
+ * Detect "tier collapse" — when every tier (utility/reasoning/deep/subagent)
+ * resolves to the same provider, an outage of that provider takes ALL tiers
+ * down with no fallback. Returns the collapsed provider id when collapse is
+ * detected, or null when at least two distinct providers are exercised across
+ * tiers.
+ *
+ * v0.40.2.1 (workspace-1xa4): the AC for `models doctor` is "Anthropic outage
+ * doesn't collapse all tiers". This detector surfaces the collapse so
+ * operators see the risk without having to manually read the tier table.
+ */
+function detectTierCollapse(report: ModelsReport): string | null {
+  const providers = new Set<string>();
+  for (const t of TIERS) {
+    const m = report.tiers[t].resolved;
+    const colon = m.indexOf(':');
+    providers.add(colon === -1 ? m.toLowerCase() : m.slice(0, colon).toLowerCase());
+  }
+  if (providers.size <= 1) {
+    return [...providers][0] ?? null;
+  }
+  return null;
+}
+
+/**
+ * Build the per-unique-model probe set. Tiers + per-task + chat/expansion all
+ * funnel through `resolveModel`, so when the user has tier collapse we'd
+ * otherwise probe the same `provider:model` 12+ times. Dedupe by
+ * `${provider}:${model}` so doctor stays cheap (~1 token per unique model
+ * instead of ~1 token per tier slot).
+ */
+function dedupModels(report: ModelsReport, chatModel: string, expansionModel: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const consider = (m: string) => {
+    const key = m.trim().toLowerCase();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(m);
+  };
+  // Tier resolutions first (canonical order — utility/reasoning/deep/subagent).
+  for (const t of TIERS) consider(report.tiers[t].resolved);
+  // Then chat + expansion (the touchpoints gateway.chat actually invokes).
+  consider(chatModel);
+  consider(expansionModel);
+  // Per-task overrides last; most will dedup to a tier, but explicit overrides
+  // are real callsites that deserve a probe.
+  for (const pt of report.per_task) consider(pt.resolved);
+  return out;
+}
+
 export async function runModels(engine: BrainEngine, args: string[]): Promise<void> {
   const json = args.includes('--json');
-  const sub = args[1] === 'doctor' ? 'doctor' : args[1] === 'help' || args.includes('--help') || args.includes('-h') ? 'help' : 'read';
+  // Subcommand detection: `gbrain models doctor` enters handleCliOnly with
+  // subArgs = ['doctor', ...flags], so the subcommand token is at args[0].
+  // (The legacy `args[1] === 'doctor'` check assumed the full main argv was
+  // passed; that path went unreachable when models routed through
+  // handleCliOnly, masking the doctor probe entirely — workspace-1xa4 RCA.)
+  const firstNonFlag = args.find(a => !a.startsWith('-'));
+  const noProbe = args.includes('--no-probe');
+  const sub: 'doctor' | 'read' | 'help' =
+    firstNonFlag === 'doctor' ? 'doctor'
+    : (firstNonFlag === 'help' || args.includes('--help') || args.includes('-h')) ? 'help'
+    : 'read';
 
   if (sub === 'help') {
     process.stdout.write(
@@ -437,6 +498,9 @@ export async function runModels(engine: BrainEngine, args: string[]): Promise<vo
 Flags (doctor only):
   --skip=<provider>               Skip a provider (e.g. --skip=openai)
                                   Repeatable: --skip=openai --skip=google
+  --no-probe                      Skip the 1-token reachability probe; only
+                                  emit config-resolution + tier-collapse signal
+                                  (scripts that want the legacy zero-cost shape)
   --json                          JSON output
 
 Configure routing:
@@ -467,34 +531,57 @@ Tiers: utility (haiku-class) | reasoning (sonnet) | deep (opus) | subagent (Anth
   const chatModel = getChatModel();
   const expansionModel = getExpansionModel();
 
+  // Build the resolution report once so the probe set, tier-collapse signal,
+  // and human output share a consistent snapshot.
+  const resolutionReport = await buildReport(engine);
+  const collapsedProvider = detectTierCollapse(resolutionReport);
+
   const results: ProbeResult[] = [];
 
-  // Config-only probe runs first: zero tokens, catches the bug class where a
-  // brain misconfigured for Voyage with the wrong embedding_dimensions would
-  // 400 on first embed. Fast feedback before we spend a single token.
+  // Config-only probes always run (zero tokens, zero network).
   results.push(await probeEmbeddingConfig());
-  // v0.35.0.0+ reranker config probe — same zero-network model as embedding.
   results.push(await probeRerankerConfig());
 
-  for (const [modelStr, touchpoint] of [[chatModel, 'chat'], [expansionModel, 'expansion']] as const) {
-    if (shouldSkipProvider(modelStr, skip)) {
-      if (!json) process.stderr.write(`[skip] ${touchpoint}: ${modelStr} (provider in --skip)\n`);
-      continue;
+  if (!noProbe) {
+    // Unique-model probe set. Avoids hitting the same `provider:model` 12
+    // times when tiers collapse to a single model — keeps the probe cheap.
+    // Each touchpoint label maps back to the gateway entry point a real
+    // caller would invoke (chat for the reasoning tier, expansion for
+    // utility) so operators can see which surface fails.
+    const probeModels = dedupModels(resolutionReport, chatModel, expansionModel);
+    for (const modelStr of probeModels) {
+      if (shouldSkipProvider(modelStr, skip)) {
+        if (!json) process.stderr.write(`[skip] ${modelStr} (provider in --skip)\n`);
+        continue;
+      }
+      // chat is the dominant touchpoint; we use it for every unique model.
+      // Expansion uses the same provider recipe → a chat probe covers it.
+      const touchpoint = modelStr === expansionModel && modelStr !== chatModel ? 'expansion' : 'chat';
+      results.push(await probeModel(modelStr, touchpoint));
     }
-    results.push(await probeModel(modelStr, touchpoint));
-  }
 
-  // v0.35.0.0+: reranker reachability (only when configured + provider not in --skip).
-  const { getRerankerModel } = await import('../core/ai/gateway.ts');
-  const rerankerModel = getRerankerModel();
-  if (rerankerModel && !shouldSkipProvider(rerankerModel, skip)) {
-    const r = await probeRerankerReachability();
-    if (r) results.push(r);
+    // v0.35.0.0+: reranker reachability (only when configured + provider not in --skip).
+    const { getRerankerModel } = await import('../core/ai/gateway.ts');
+    const rerankerModel = getRerankerModel();
+    if (rerankerModel && !shouldSkipProvider(rerankerModel, skip)) {
+      const r = await probeRerankerReachability();
+      if (r) results.push(r);
+    }
   }
 
   const report = {
     schema_version: 1 as const,
     probes: results,
+    tier_collapse: collapsedProvider
+      ? {
+          collapsed: true as const,
+          provider: collapsedProvider,
+          warning:
+            `All 4 tiers resolve to provider "${collapsedProvider}". A ${collapsedProvider} ` +
+            `outage will take every tier down with no fallback. Configure at least one ` +
+            `non-${collapsedProvider} tier via \`gbrain config set models.tier.<utility|reasoning|deep|subagent> <provider>:<model>\`.`,
+        }
+      : { collapsed: false as const },
     summary: {
       total: results.length,
       ok: results.filter(r => r.status === 'ok').length,
@@ -513,6 +600,9 @@ Tiers: utility (haiku-class) | reasoning (sonnet) | deep (opus) | subagent (Anth
         process.stdout.write(`      ${r.message}\n`);
         if (r.fix) process.stdout.write(`      fix: ${r.fix}\n`);
       }
+    }
+    if (report.tier_collapse.collapsed) {
+      process.stdout.write(`\n⚠ tier collapse: ${report.tier_collapse.warning}\n`);
     }
     process.stdout.write(`\nSummary: ${report.summary.ok}/${report.summary.total} reachable.\n`);
   }
