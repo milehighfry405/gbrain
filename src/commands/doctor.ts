@@ -3442,9 +3442,15 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
       const fixHint = report.partial
         ? `Raise GBRAIN_DOCTOR_FM_TIMEOUT_MS or run \`gbrain frontmatter validate <source>\` directly. Fix issues: \`gbrain frontmatter validate <source> --fix\``
         : `Fix: gbrain frontmatter validate <source-path> --fix`;
+      // Codex P2 #1: branch on partial-with-no-other-signal first so a
+      // timeout/skipped scan with no errors and no warnings doesn't render as
+      // "0 source(s) with high ignored-frontmatter ratio" — that hid the real
+      // reason for warn status.
       const headline = report.total > 0
         ? `${report.total} frontmatter issue(s)`
-        : `${report.warnings.length} source(s) with high ignored-frontmatter ratio`;
+        : report.warnings.length > 0
+          ? `${report.warnings.length} source(s) with high ignored-frontmatter ratio`
+          : `Frontmatter scan incomplete`;
       checks.push({
         name: 'frontmatter_integrity',
         status: 'warn',

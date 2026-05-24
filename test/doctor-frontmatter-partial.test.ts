@@ -82,3 +82,24 @@ describe('doctor frontmatter_integrity — load-bearing render strings', () => {
     expect(partialHintMatch).toBe(true);
   });
 });
+
+// workspace-icm4 codex P2 #1 — partial scan with no errors AND no warnings
+// must NOT render as "0 source(s) with high ignored-frontmatter ratio". The
+// headline must branch on `report.warnings.length > 0` before falling back to
+// the "scan incomplete" wording so the operator sees the real reason for warn.
+describe('doctor frontmatter_integrity — headline branching (workspace-icm4 P2 #1)', () => {
+  test('source emits "Frontmatter scan incomplete" fallback for the no-errors no-warnings partial path', () => {
+    expect(DOCTOR_SOURCE).toContain('Frontmatter scan incomplete');
+  });
+
+  test('source guards the high-ratio headline on warnings.length > 0', () => {
+    // Headline must be conditional on warnings count — pre-fix it was
+    // unconditional `${report.warnings.length} source(s)...` and rendered
+    // "0 source(s)..." on the partial-no-warnings path.
+    expect(DOCTOR_SOURCE).toContain('report.warnings.length > 0');
+  });
+
+  test('source includes the high-ignored-ratio wording for the warnings path', () => {
+    expect(DOCTOR_SOURCE).toContain('source(s) with high ignored-frontmatter ratio');
+  });
+});

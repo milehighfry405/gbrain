@@ -107,7 +107,9 @@ const IGNORED_RATIO_MIN_FILES = 4;
 function readIgnoredRatioThreshold(): number {
   const raw = process.env.GBRAIN_FRONTMATTER_IGNORED_RATIO_WARN;
   if (!raw) return DEFAULT_IGNORED_MISSING_OPEN_RATIO_WARN;
-  const n = parseFloat(raw);
+  // Codex P2 #3: Number() rejects partially-invalid strings ("0.5abc") that
+  // parseFloat silently coerces. Predictable config parsing > permissive.
+  const n = Number(raw.trim());
   // Allow values >1 as a "never warn" sentinel — useful for sources the
   // operator has explicitly acknowledged as non-wiki (e.g. repo mirrors).
   if (!Number.isFinite(n) || n < 0) return DEFAULT_IGNORED_MISSING_OPEN_RATIO_WARN;
@@ -569,6 +571,9 @@ export async function scanBrainSources(
   for (const src of perSource) {
     if (src.status !== 'scanned') continue;
     if (src.files_scanned < IGNORED_RATIO_MIN_FILES) continue;
+    // Codex P2 #2: short-circuit before ratio compare so threshold=0 doesn't
+    // warn on clean sources (0 < 0 is false, but 0 >= 0 would fire).
+    if (src.ignoredMissingOpen === 0) continue;
     const ratio = src.ignoredMissingOpen / src.files_scanned;
     if (ratio < ignoredRatioThreshold) continue;
     const pct = Math.round(ratio * 100);
