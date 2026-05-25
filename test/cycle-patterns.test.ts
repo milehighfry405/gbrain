@@ -165,4 +165,18 @@ describe('patterns/synthesize slug-prefix contract (workspace-l5o.33)', () => {
     });
     expect(covered).toBe(true);
   });
+
+  test('synthesize verdict-pass strips anthropic: prefix before SDK call (workspace-l5o.11)', () => {
+    // The synth phase has TWO SDK boundaries that both call client.create
+    // directly (skipping gateway.chat's parseModelId): subagent.ts (dispatch
+    // path) AND synthesize.ts:683 (verdict pass). Both MUST strip the
+    // `anthropic:` prefix or @anthropic-ai/sdk returns 404 not_found_error.
+    // ac6654fa landed both originally; the quiet-magnolia cherry-pick
+    // (2026-05-24) dropped the synthesize.ts hunk during conflict resolution,
+    // and the 2026-05-25 09:00 UTC nightly cron failed with the 404. This
+    // assertion pins the verdict-pass strip so a future cherry-pick can't
+    // silently drop it again. Subagent.ts has its own helper bareAnthropicModelId.
+    expect(synthSrc).toMatch(/bareVerdictModel[^=]*=[^;]*verdictModel.*slice.*'anthropic:'/s);
+    expect(synthSrc).toMatch(/model:\s*bareVerdictModel/);
+  });
 });

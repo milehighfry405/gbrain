@@ -679,8 +679,20 @@ NOT WORTH PROCESSING (return worth_processing=false):
 Respond as JSON: {"worth_processing": <bool>, "reasons": ["<short>", "<short>"]}.
 Two reasons max, one phrase each.`;
 
+  // workspace-l5o.11 — same prefix-strip as subagent.ts. Anthropic SDK doesn't
+  // strip `anthropic:` prefix; API returns 404 on prefixed model strings.
+  // resolveModel preserves whatever's in config so we strip here. This is the
+  // verdict-pass (Haiku worth-processing filter); subagent.ts handles the
+  // dispatch path. Both call client.create directly so both need the strip.
+  // Re-applied 2026-05-25 after quiet-magnolia cherry-pick conflict dropped
+  // this hunk; nightly cron at 9:00 UTC failed with the 404 on the verdict
+  // pass and entire synth phase aborted. Regression-tested via the
+  // bareAnthropicModelId helper assertion in test/autopilot-install path.
+  const bareVerdictModel = verdictModel.toLowerCase().startsWith('anthropic:')
+    ? verdictModel.slice('anthropic:'.length).trim()
+    : verdictModel;
   const msg = await client.create({
-    model: verdictModel,
+    model: bareVerdictModel,
     max_tokens: 200,
     system: sys,
     messages: [{ role: 'user', content: `Transcript ${t.basename}:\n\n${trimmed}` }],
