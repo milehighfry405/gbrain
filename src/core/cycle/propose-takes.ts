@@ -388,27 +388,20 @@ class ProposeTakesPhase extends BaseCyclePhase {
       // because the composite idempotency key is on the per-page tuple — a
       // bulk UPSERT would collapse a same-page-multi-claim run into one row.
       for (const p of proposals) {
-        await engine.executeRaw(
-          `INSERT INTO take_proposals
-             (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
-              claim_text, kind, holder, weight, domain, dedup_against_fence_rows, model_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-           ON CONFLICT (source_id, page_slug, content_hash, prompt_version) DO NOTHING`,
-          [
-            sourceId,
-            page.slug,
-            ch,
-            promptVersion,
-            proposalRunId,
-            p.claim_text,
-            p.kind,
-            p.holder,
-            p.weight,
-            p.domain ?? null,
-            JSON.stringify(existingTakes),
-            opts.model ?? 'claude-sonnet-4-6',
-          ],
-        );
+        await insertProposalWithRetry(engine, [
+          sourceId,
+          page.slug,
+          ch,
+          promptVersion,
+          proposalRunId,
+          p.claim_text,
+          p.kind,
+          p.holder,
+          p.weight,
+          p.domain ?? null,
+          JSON.stringify(existingTakes),
+          opts.model ?? 'claude-sonnet-4-6',
+        ]);
         result.proposals_inserted += 1;
       }
     }
@@ -434,6 +427,50 @@ export async function runPhaseProposeTakes(
   return new ProposeTakesPhase().run(ctx, opts);
 }
 
+// workspace-l5o.32: Supabase session-mode pooler intermittently drops
+// connections mid-INSERT with "write CONNECTION_CLOSED ...". The single
+// failure aborts the entire propose_takes phase (the cycle marks status=fail
+// and the operator loses the day's take proposals — observed 2026-05-25
+// 09:00 UTC nightly cron). Wrap each INSERT in a small retry loop: 3 tries
+// with exponential backoff (200ms, 600ms, 1800ms). Only retries on
+// transient pool/network errors; structural errors (constraint violations,
+// bad data) surface immediately. Per-proposal granularity so one bad row
+// can't poison the rest of the batch.
+const POOL_TRANSIENT_RE = /CONNECTION_CLOSED|ECONNRESET|ETIMEDOUT|Connection terminated unexpectedly|server closed the connection unexpectedly|read ECONNRESET|write EPIPE/i;
+
+export async function insertProposalWithRetry(
+  engine: BrainEngine,
+  params: unknown[],
+  opts: { maxAttempts?: number; baseDelayMs?: number } = {},
+): Promise<void> {
+  const maxAttempts = opts.maxAttempts ?? 3;
+  const baseDelay = opts.baseDelayMs ?? 200;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await engine.executeRaw(
+        `INSERT INTO take_proposals
+           (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
+            claim_text, kind, holder, weight, domain, dedup_against_fence_rows, model_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT (source_id, page_slug, content_hash, prompt_version) DO NOTHING`,
+        params,
+      );
+      return;
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      // Only retry on transient pool/network errors. Structural errors
+      // (FK violations, bad data) surface immediately.
+      if (!POOL_TRANSIENT_RE.test(msg)) throw err;
+      if (attempt < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, baseDelay * Math.pow(3, attempt - 1)));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 /** Test-only access to the class for subclassing in tests. */
 export const __testing = {
   ProposeTakesPhase,
@@ -441,4 +478,5 @@ export const __testing = {
   contentHash,
   hasCompleteFence,
   extractExistingTakesForDedup,
+  POOL_TRANSIENT_RE,
 };

@@ -22,6 +22,7 @@ import {
   hasCompleteFence,
   extractExistingTakesForDedup,
   PROPOSE_TAKES_PROMPT_VERSION,
+  insertProposalWithRetry,
   type ProposeTakesExtractor,
   type ProposedTake,
 } from '../src/core/cycle/propose-takes.ts';
@@ -381,5 +382,69 @@ New prose appended here.`;
     expect(runIdA).toBe(runIdB);
     expect(typeof runIdA).toBe('string');
     expect((runIdA as string).startsWith('propose-')).toBe(true);
+  });
+});
+
+// workspace-l5o.32 — Supabase pooler intermittently drops mid-INSERT.
+// insertProposalWithRetry wraps each INSERT with bounded retry on
+// transient pool/network errors only; structural errors (FK, constraint)
+// surface immediately. Without this the 2026-05-25 09:00 UTC nightly cron
+// failed the entire propose_takes phase on a single CONNECTION_CLOSED.
+describe('insertProposalWithRetry (workspace-l5o.32)', () => {
+  const fakeParams = ['default', 'wiki/x', 'h', 'v', 'r', 'claim', 'fact', 'h1', 0.5, null, '[]', 'm'];
+
+  test('happy path: single attempt, no retry', async () => {
+    let calls = 0;
+    const engine = { executeRaw: async () => { calls++; return []; } } as unknown as BrainEngine;
+    await insertProposalWithRetry(engine, fakeParams);
+    expect(calls).toBe(1);
+  });
+
+  test('retries on CONNECTION_CLOSED then succeeds', async () => {
+    let calls = 0;
+    const engine = {
+      executeRaw: async () => {
+        calls++;
+        if (calls < 3) throw new Error('write CONNECTION_CLOSED aws-1-us-west-1.pooler.supabase.com:5432');
+        return [];
+      },
+    } as unknown as BrainEngine;
+    await insertProposalWithRetry(engine, fakeParams, { baseDelayMs: 1 });
+    expect(calls).toBe(3);
+  });
+
+  test('throws after max attempts on persistent transient error', async () => {
+    let calls = 0;
+    const engine = {
+      executeRaw: async () => { calls++; throw new Error('write CONNECTION_CLOSED'); },
+    } as unknown as BrainEngine;
+    await expect(insertProposalWithRetry(engine, fakeParams, { baseDelayMs: 1 })).rejects.toThrow(/CONNECTION_CLOSED/);
+    expect(calls).toBe(3);
+  });
+
+  test('does NOT retry on structural errors (FK violation)', async () => {
+    let calls = 0;
+    const engine = {
+      executeRaw: async () => { calls++; throw new Error('insert violates foreign key constraint "take_proposals_source_id_fkey"'); },
+    } as unknown as BrainEngine;
+    await expect(insertProposalWithRetry(engine, fakeParams, { baseDelayMs: 1 })).rejects.toThrow(/foreign key/);
+    expect(calls).toBe(1);
+  });
+
+  test('matches multiple transient signatures (ECONNRESET, ETIMEDOUT, server-closed)', async () => {
+    const transientMessages = [
+      'read ECONNRESET',
+      'connect ETIMEDOUT 1.2.3.4:5432',
+      'Connection terminated unexpectedly',
+      'server closed the connection unexpectedly',
+    ];
+    for (const msg of transientMessages) {
+      let calls = 0;
+      const engine = {
+        executeRaw: async () => { calls++; if (calls < 2) throw new Error(msg); return []; },
+      } as unknown as BrainEngine;
+      await insertProposalWithRetry(engine, fakeParams, { baseDelayMs: 1 });
+      expect(calls).toBe(2);
+    }
   });
 });
